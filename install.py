@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 
@@ -92,18 +93,67 @@ def pick_cuda_wheel() -> str | None:
     return None
 
 
-def verify_import() -> bool:
-    """在子进程里真正 import 一次 llama_cpp。
+def _prepare_dll_env() -> None:
+    """把 CUDA 12 运行库所在目录并入 PATH，供 CUDA 版轮子的 llama.dll / ggml-cuda.dll 加载。
+
+    官方 cu124 轮子**不自带** cudart/cublas（只有内核），必须从外部找到它们。
+    WebUI 自带的 torch 里正好有 CUDA 12 的运行库
+    （cudart64_12 / cublas64_12 / cublasLt64_12），最优先使用它——这样没装 CUDA Toolkit
+    的机器也能用 CUDA 版；其次再补本机 CUDA Toolkit 的 bin 目录。
+
+    这一步必须做，否则 verify_import() 会因找不到依赖 DLL 而失败，把可用的 CUDA 版误判为不可用。
+    """
+    if os.name != "nt":
+        return
+    dirs: list[str] = []
+    try:
+        import torch  # cpu_supports_avx2() 已导入过，这里基本无额外开销
+
+        tlib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(tlib):
+            dirs.append(tlib)
+    except Exception:
+        pass
+    for env in ("CUDA_PATH", "CUDA_HOME"):
+        base = os.environ.get(env)
+        if base:
+            dirs += [os.path.join(base, "bin", "x64"), os.path.join(base, "bin")]
+    root = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+    try:
+        def _ver_key(name: str):
+            return tuple(int(x) for x in re.findall(r"\d+", name)) or (0,)
+
+        for ver in sorted(os.listdir(root), key=_ver_key, reverse=True):
+            dirs += [os.path.join(root, ver, "bin", "x64"), os.path.join(root, ver, "bin")]
+    except Exception:
+        pass
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    if not dirs:
+        return
+    # 子进程（pip / import 校验）默认继承本进程环境，故改 PATH 即可生效
+    os.environ["PATH"] = os.pathsep.join(dirs + [os.environ.get("PATH", "")])
+    for d in dirs:
+        try:
+            os.add_dll_directory(d)
+        except Exception:
+            pass
+
+
+def verify_import() -> tuple[bool, str]:
+    """在子进程里真正 import 一次 llama_cpp，返回 (是否成功, 失败原因)。
 
     放到子进程是为了不被拖累：若装上的构建与 CPU 指令集不兼容，导入会直接
-    以 Illegal instruction 结束进程，在子进程里失败也不会影响 install.py 继续兜底。
+    以 Illegal instruction 结束进程；同时把失败原因带回来，便于在启动日志里定位。
     """
     try:
         r = subprocess.run([sys.executable, "-c", f"import {IMPORT_NAME}"],
                            capture_output=True, text=True, timeout=180)
-        return r.returncode == 0
-    except Exception:
-        return False
+    except Exception as e:
+        return False, str(e)
+    if r.returncode == 0:
+        return True, ""
+    lines = [ln.strip() for ln in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if ln.strip()]
+    return False, (lines[-1] if lines else f"退出码 {r.returncode}")
 
 
 def install_wheel(wheel: str) -> int:
@@ -138,16 +188,22 @@ def install_cpu() -> bool:
     wheel = pick_local_wheel()
     if wheel is not None:
         try:
-            if install_wheel(wheel) == 0 and verify_import():
-                return True
-            _log("本地轮子安装后无法导入，改用在线方式")
+            if install_wheel(wheel) == 0:
+                ok, why = verify_import()
+                if ok:
+                    return True
+                _log(f"本地轮子安装后无法导入：{why}，改用在线方式")
         except Exception as e:
             _log(f"本地安装失败：{e}")
     try:
-        return install_from_index("CPU", CPU_INDEX) == 0 and verify_import()
+        if install_from_index("CPU", CPU_INDEX) == 0:
+            ok, why = verify_import()
+            if ok:
+                return True
+            _log(f"在线安装的 CPU 版无法导入：{why}")
     except Exception as e:
         _log(f"在线安装失败（CPU）：{e}")
-        return False
+    return False
 
 
 def quarantine(wheel: str) -> None:
@@ -171,6 +227,8 @@ def remove_quiet(path: str) -> None:
 
 
 def main() -> None:
+    _prepare_dll_env()  # CUDA 版轮子依赖 cudart/cublas：先把 DLL 搜索路径补好再校验
+
     if cpu_supports_avx2() is False:
         _log("当前 CPU 不支持 AVX2，跳过安装（预编译轮子会崩溃，标签翻译将仅使用内置词典）")
         return
@@ -179,17 +237,20 @@ def main() -> None:
     cuda_wheel = pick_cuda_wheel()
     if cuda_wheel is not None:
         try:
-            if install_wheel(cuda_wheel) == 0 and verify_import():
-                remove_quiet(cuda_wheel)  # 装好即删，避免每次启动重复强装
-                _log("已安装 CUDA 版 llama-cpp-python（GPU 优先，显存不足时自动改用 CPU）")
-                return
+            if install_wheel(cuda_wheel) == 0:
+                ok, why = verify_import()
+                if ok:
+                    remove_quiet(cuda_wheel)  # 装好即删，避免每次启动重复强装
+                    _log("已安装 CUDA 版 llama-cpp-python（GPU 优先，显存不足时自动改用 CPU）")
+                    return
+                _log(f"CUDA 版安装后无法导入：{why}")
         except Exception as e:
             _log(f"CUDA 版安装失败：{e}")
         quarantine(cuda_wheel)
         _log("CUDA 版不可用，改用 CPU 版")
 
     # 2) 已装且能正常导入 → 不动
-    if already_installed() and verify_import():
+    if already_installed() and verify_import()[0]:
         return
 
     # 3) CPU 版保底（本地零网络优先）

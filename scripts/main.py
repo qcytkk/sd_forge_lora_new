@@ -849,14 +849,18 @@ _llm_last_note = ""      # 最近一次模型推理为何没产出译文（供�
 
 
 def _prepare_llama_dll_env() -> None:
-    """把 CUDA 运行库目录并入 PATH，供 CUDA 版 llama.dll 加载依赖（只做一次）。
+    """把 CUDA 运行库所在目录并入 PATH，供 CUDA 版 llama.dll / ggml-cuda.dll 加载依赖（只做一次）。
 
-    CUDA 构建的 llama.dll 依赖 cudart/cublas 等运行时 DLL，而 llama_cpp 自带的
-    加载器只通过 CUDA_PATH 环境变量定位它们（ctypes 默认加载模式不读
-    os.add_dll_directory）。若 WebUI 进程的 PATH 里没有 CUDA —— 例如从桌面
-    快捷方式启动、或 CUDA Toolkit 未加入系统 PATH —— import llama_cpp 会因
-    llama.dll 加载失败抛 RuntimeError，插件就会误报「未检测到 llama_cpp 模块」。
-    这里主动补齐 PATH，使插件不依赖启动环境。
+    官方 CUDA 轮子**不自带** cudart/cublas，必须从外部找到它们，否则 import llama_cpp
+    会因 llama.dll 加载失败抛 RuntimeError（表现为插件误报「未检测到 llama_cpp 模块」，
+    或下载好的 CUDA 版被判为不可用）。搜索顺序：
+
+    1) WebUI 自带 torch 的 lib 目录（含 CUDA 12 的 cudart64_12 / cublas64_12 / cublasLt64_12）
+       —— 覆盖绝大多数用户，无需额外安装 CUDA Toolkit；
+    2) CUDA_PATH / CUDA_HOME 指向的 bin；
+    3) C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\* 的 bin（版本倒序）。
+
+    这一步让插件不依赖启动环境（从桌面快捷方式启动、CUDA 未加入系统 PATH 都能正常工作）。
     """
     global _llama_dll_ready
     if _llama_dll_ready:
@@ -865,6 +869,16 @@ def _prepare_llama_dll_env() -> None:
     if os.name != "nt":
         return
     dirs: list[str] = []
+    # WebUI 自带的 torch 里带有 CUDA 12 运行库（cudart64_12 / cublas64_12 / cublasLt64_12），
+    # 正是 llama-cpp-python 的 CUDA 轮子（cu124）所依赖的——官方轮子不自带这些 DLL。
+    # 优先用它，用户就不必另外安装 CUDA Toolkit 也能加载 CUDA 版轮子。
+    try:
+        import torch
+        tlib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(tlib):
+            dirs.append(tlib)
+    except Exception:
+        pass
     for env in ("CUDA_PATH", "CUDA_HOME"):
         base = os.environ.get(env)
         if base:
@@ -882,6 +896,11 @@ def _prepare_llama_dll_env() -> None:
     dirs = [d for d in dirs if os.path.isdir(d)]
     if dirs:
         os.environ["PATH"] = os.pathsep.join(dirs + [os.environ.get("PATH", "")])
+        for d in dirs:
+            try:
+                os.add_dll_directory(d)
+            except Exception:
+                pass
 
 
 def _llm_engine_ready() -> bool:
