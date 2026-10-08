@@ -31,6 +31,9 @@
     llmRepoFiles: '/lora_new/api/llm_repo_files',
     llmDownload: '/lora_new/api/llm_download',
     llmDownloadStatus: '/lora_new/api/llm_download_status',
+    runtimeInfo: '/lora_new/api/runtime_info',
+    runtimeDownloadCuda: '/lora_new/api/runtime_download_cuda',
+    runtimeDownloadStatus: '/lora_new/api/runtime_download_status',
     use: '/lora_new/api/use',
     view: '/lora_new/api/view',
     dictLookup: '/lora_new/api/dict_lookup',
@@ -1006,6 +1009,21 @@
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
+                  <span class="lna-switch-name">翻译运行环境</span>
+                  <span class="lna-switch-desc">CPU 版随插件离线安装，开箱即可用。需要 GPU 加速时在此下载 CUDA 版（约 490MB）：下载完成后重启 WebUI 会自动安装并生效。CUDA 版自带 CPU 后端，显存不足时仍会回退 CPU。</span>
+                </span>
+                <div class="lna-llm-dl">
+                  <div class="lna-llm-dl-row">
+                    <span class="lna-runtime-state" role="status" aria-live="polite">读取中…</span>
+                  </div>
+                  <div class="lna-llm-dl-row">
+                    <button class="dlg-btn dlg-action lna-runtime-install" type="button">安装 CUDA 版本，使用 GPU 推理</button>
+                  </div>
+                  <div class="lna-llm-progress lna-runtime-progress" role="status" aria-live="polite" hidden></div>
+                </div>
+              </div>
+              <div class="lna-switch-row">
+                <span class="lna-switch-text">
                   <span class="lna-switch-name">空闲时自动卸载模型</span>
                   <span class="lna-switch-desc">翻译完成后超过设定时长无新翻译，自动释放模型占用的显存/内存；下次翻译会重新加载（GPU 需几秒）。范围 ${IDLE_MIN}–${IDLE_MAX} 分钟。</span>
                 </span>
@@ -1542,6 +1560,118 @@
     sel.value = pickPreferredFile(files);
   }
 
+  // ---------- 翻译运行环境（CPU / CUDA 版 llama-cpp-python） ----------
+  function setRuntimeProgress(modal, text, isErr) {
+    const box = modal.querySelector('.lna-runtime-progress');
+    if (!box) return;
+    if (!text) { box.hidden = true; box.textContent = ''; return; }
+    box.hidden = false;
+    box.textContent = text;
+    box.classList.toggle('is-err', !!isErr);
+  }
+
+  // 读取并渲染当前运行环境；返回后端数据（失败为 null）
+  async function refreshRuntimeInfo(modal) {
+    const state = modal.querySelector('.lna-runtime-state');
+    const btn = modal.querySelector('.lna-runtime-install');
+    if (!state || !btn) return null;
+    let info = null;
+    try {
+      const r = await fetch(API.runtimeInfo);
+      info = await r.json();
+    } catch (e) { info = null; }
+    if (!document.contains(modal)) return null;
+    if (!info || !info.ok) {
+      state.textContent = '读取运行环境失败';
+      btn.disabled = true;
+      return null;
+    }
+    let text = '';
+    let canDownload = false;
+    if (info.build === 'cuda') {
+      text = info.usable ? '已是 CUDA 版：GPU 优先，显存不足时自动改用 CPU' : 'CUDA 版已安装，但无法加载';
+    } else if (info.cuda_wheel_ready) {
+      text = 'CUDA 版已下载，重启 WebUI 后自动安装并生效';
+    } else if (!info.nvidia_ok) {
+      text = info.driver
+        ? `当前为 CPU 版（NVIDIA 驱动 ${info.driver} 低于 ${info.min_driver}，无法使用 GPU）`
+        : '当前为 CPU 版（未检测到 NVIDIA 显卡）';
+    } else {
+      text = '当前为 CPU 版（可下载 CUDA 版以启用 GPU 推理）';
+      canDownload = true;
+    }
+    state.textContent = text;
+    btn.disabled = !canDownload;
+    btn.title = canDownload ? '下载约 490MB 的 CUDA 版轮子；下载完成后重启 WebUI 自动安装' : '';
+    return info;
+  }
+
+  function bindRuntimeRow(modal) {
+    const btn = modal.querySelector('.lna-runtime-install');
+    if (!btn) return;
+    let pollTimer = null;
+
+    function stopPoll() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    function startPoll() {
+      stopPoll();
+      btn.disabled = true;
+      pollTimer = setInterval(async () => {
+        if (!document.contains(modal)) { stopPoll(); return; }
+        let st = null;
+        try {
+          const r = await fetch(API.runtimeDownloadStatus);
+          st = await r.json();
+        } catch (e) { return; }
+        if (!st || !st.ok) return;
+        if (st.active) {
+          const pct = st.total ? ((st.done / st.total) * 100).toFixed(1) : '?';
+          const retry = st.attempt > 1 ? ` · 第 ${st.attempt} 次续传` : '';
+          setRuntimeProgress(modal,
+            `正在下载 CUDA 版：${fmtSize(st.done)}${st.total ? ' / ' + fmtSize(st.total) : ''}（${pct}%）${retry}`);
+          return;
+        }
+        stopPoll();
+        if (st.cuda_wheel_ready) {
+          setRuntimeProgress(modal, 'CUDA 版已下载完成，请重启 WebUI：启动时会自动安装并生效');
+          flashToast('CUDA 版下载完成，重启 WebUI 后生效');
+        } else {
+          setRuntimeProgress(modal, st.error || '下载未完成', true);
+        }
+        refreshRuntimeInfo(modal);
+      }, 1000);
+    }
+
+    refreshRuntimeInfo(modal);
+    // 弹窗重新打开时若后端仍在下载，接续显示进度
+    (async () => {
+      try {
+        const r = await fetch(API.runtimeDownloadStatus);
+        const res = await r.json();
+        if (res && res.ok && res.active && document.contains(modal)) startPoll();
+      } catch (e) {}
+    })();
+
+    btn.addEventListener('click', async () => {
+      setRuntimeProgress(modal, '正在准备下载…');
+      try {
+        const r = await fetch(API.runtimeDownloadCuda, { method: 'POST' });
+        const res = await r.json();
+        if (!res || !res.ok) {
+          setRuntimeProgress(modal, (res && res.error) || '下载启动失败', true);
+          refreshRuntimeInfo(modal);
+          return;
+        }
+      } catch (e) {
+        setRuntimeProgress(modal, '下载启动失败：请求出错', true);
+        return;
+      }
+      startPoll();
+    });
+  }
+
   function bindLlmSettings(modal) {
     const sel = modal.querySelector('.lna-llm-select');
     const refresh = modal.querySelector('.lna-llm-refresh');
@@ -1558,6 +1688,7 @@
     refreshLlmIdle(modal);       // 同步空闲自动卸载开关与分钟数
     refreshTranslateMode(modal); // 同步翻译方案（仅用对照表 / 仅用模型翻译 / 混合）
     bindPromptPresets(modal);    // 翻译提示预设：下拉切换 + 保存 + 删除
+    bindRuntimeRow(modal);       // 翻译运行环境：状态 + 下载 CUDA 版
 
     // 若后端仍有下载任务在进行（例如关掉弹窗又打开），接续显示进度
     (async () => {

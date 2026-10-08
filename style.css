@@ -1113,6 +1113,11 @@ body.dark .lna-dialog .lna-prompt-select { border-color: #374151; background: #1
 }
 body.dark .lna-dialog .lna-llm-progress { color: #86efac; background: #052e16; border-color: #166534; }
 body.dark .lna-dialog .lna-llm-progress.is-err { color: #fca5a5; background: #450a0a; border-color: #991b1b; }
+/* 翻译运行环境：当前构建状态文案 */
+.lna-dialog .lna-runtime-state { font-size: 13px; line-height: 1.5; color: #374151; }
+body.dark .lna-dialog .lna-runtime-state { color: #d1d5db; }
+/* 翻译运行环境：安装按钮的禁用态（已装 CUDA 版 / 无 N 卡 / 下载中） */
+.lna-dialog .dlg-btn.lna-runtime-install:disabled { opacity: .6; cursor: not-allowed; }
 .lna-dialog .lna-size-input:focus {
   outline: none;
   border-color: #ea580c;

@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -45,6 +49,18 @@ try:
     LLM_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
     pass
+
+# 翻译运行时（llama-cpp-python）随插件分发的 CPU 轮子目录；
+# wheels/cuda/ 存放用户在设置里按需下载的 CUDA 轮子（两处轮子文件名相同，靠目录区分）
+WHEELS_DIR = EXT_DIR / "wheels"
+CUDA_WHEELS_DIR = WHEELS_DIR / "cuda"
+RUNTIME_VERSION = "0.3.36"  # 与随插件分发的 CPU 轮子保持一致
+CUDA_WHEEL_NAME = f"llama_cpp_python-{RUNTIME_VERSION}-py3-none-win_amd64.whl"
+CUDA_WHEEL_URL = (
+    f"https://github.com/abetlen/llama-cpp-python/releases/download/"
+    f"v{RUNTIME_VERSION}-cu124/{CUDA_WHEEL_NAME}"
+)
+MIN_CUDA_DRIVER = (527, 41)  # cu124 要求的最低 NVIDIA 驱动版本
 
 # LoRA 目录
 try:
@@ -1370,6 +1386,210 @@ def _download_worker(repo: str, filename: str) -> None:
             _download_state.update(active=False, ok=False, error=f"下载失败：{e}")
 
 
+# ---------- 翻译运行时的构建探测与 CUDA 轮子下载 ----------
+_runtime_probe_lock = threading.Lock()
+_runtime_probe_cache: dict[str, Any] = {"at": 0.0, "value": None}
+RUNTIME_PROBE_TTL = 60.0  # 探测结果缓存秒数：设置弹窗可能反复查询
+
+_runtime_dl_lock = threading.Lock()
+_runtime_dl_state: dict[str, Any] = {
+    "active": False, "done": 0, "total": 0, "error": "", "ok": False, "attempt": 0,
+}
+
+
+def _probe_runtime(force: bool = False) -> dict:
+    """探测当前 llama-cpp-python 的构建类型与可用性。
+
+    必须放到子进程里执行：CUDA 版若缺少运行库，导入可能直接结束进程；
+    同时也要能区分「装了但导不进来」（此时 CPU/GPU 都用不了）。
+    """
+    with _runtime_probe_lock:
+        cached = _runtime_probe_cache["value"]
+        if not force and cached is not None and (time.time() - _runtime_probe_cache["at"]) < RUNTIME_PROBE_TTL:
+            return cached
+    result = {"installed": False, "usable": False, "build": ""}
+    code = (
+        "import llama_cpp;"
+        "info=llama_cpp.llama_print_system_info();"
+        "info=info.decode('utf-8','ignore') if isinstance(info,bytes) else str(info);"
+        "print('__LNA_CUDA__' if 'CUDA' in info else '__LNA_CPU__')"
+    )
+    try:
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        if p.returncode == 0:
+            out = p.stdout or ""
+            result["installed"] = True
+            result["usable"] = True
+            result["build"] = "cuda" if "__LNA_CUDA__" in out else ("cpu" if "__LNA_CPU__" in out else "")
+    except Exception:
+        pass
+    if not result["installed"]:
+        try:
+            result["installed"] = importlib.util.find_spec("llama_cpp") is not None
+        except Exception:
+            result["installed"] = False
+    with _runtime_probe_lock:
+        _runtime_probe_cache.update(at=time.time(), value=result)
+    return result
+
+
+def _nvidia_driver() -> str:
+    """NVIDIA 驱动版本字符串；无 N 卡或没有 nvidia-smi 时返回空串。"""
+    try:
+        p = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return ""
+    if p.returncode != 0:
+        return ""
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    return lines[0] if lines else ""
+
+
+def _nvidia_ok() -> tuple[bool, str]:
+    """(驱动是否满足 cu124 的最低要求, 驱动版本字符串)。"""
+    ver = _nvidia_driver()
+    nums = re.findall(r"\d+", ver)
+    ok = len(nums) >= 2 and (int(nums[0]), int(nums[1])) >= MIN_CUDA_DRIVER
+    return ok, ver
+
+
+def _cuda_wheel_path() -> Path:
+    return CUDA_WHEELS_DIR / CUDA_WHEEL_NAME
+
+
+def _cuda_wheel_downloaded() -> bool:
+    try:
+        return _cuda_wheel_path().is_file()
+    except Exception:
+        return False
+
+
+def _cuda_wheel_partial_size() -> int:
+    """未完成下载留下的 .part 大小（字节）；用于让进度条从中断处开始显示。"""
+    p = _cuda_wheel_path()
+    part = p.with_suffix(p.suffix + ".part")
+    try:
+        return part.stat().st_size if part.is_file() else 0
+    except Exception:
+        return 0
+
+
+def _remote_file_size(url: str) -> int:
+    """取远端文件总大小（字节）；失败返回 0（表示未知）。
+
+    用 `Range: bytes=0-0` 读 Content-Range 里的总长度，而不用 HEAD：
+    GitHub 的下载链接对 HEAD 会超时（实测），而带 Range 的 GET 稳定可用，
+    且与真正的下载走同一条路径。用于校验断点续传的半成品是否与远端一致。
+    """
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "sd-forge-lora-new", "Range": "bytes=0-0"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            content_range = resp.headers.get("Content-Range") or ""
+            if "/" in content_range:
+                tail = content_range.rsplit("/", 1)[-1].strip()
+                if tail.isdigit():
+                    return int(tail)
+            return int(resp.headers.get("Content-Length") or 0)
+    except Exception:
+        return 0
+
+
+def _cuda_wheel_worker() -> None:
+    """后台下载 CUDA 轮子到 wheels/cuda/；断流用 Range 续传，实时更新进度。
+
+    任务彻底失败时**保留 .part 半成品**，用户再点一次即可从断点继续，不必重下整个文件。
+    """
+    dest = _cuda_wheel_path()
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    last_err = ""
+    total = 0
+    try:
+        CUDA_WHEELS_DIR.mkdir(parents=True, exist_ok=True)
+        remote_size = _remote_file_size(CUDA_WHEEL_URL)
+
+        # 半成品预检：比远端还大说明是过期/损坏的残留（远端已换文件），丢掉重下；
+        # 正好等于远端大小说明上次其实已经下完，直接改名收尾。
+        if tmp.exists() and remote_size:
+            have = tmp.stat().st_size
+            if have > remote_size:
+                tmp.unlink()
+            elif have == remote_size:
+                tmp.replace(dest)
+                with _runtime_dl_lock:
+                    _runtime_dl_state.update(active=False, ok=True, error="")
+                return
+
+        for attempt in range(1, DL_MAX_ATTEMPTS + 1):
+            got = tmp.stat().st_size if tmp.exists() else 0
+            if remote_size and got >= remote_size:
+                break  # 已下满，交给循环外的完整性确认收尾
+            headers = {"User-Agent": "sd-forge-lora-new"}
+            if got:
+                headers["Range"] = f"bytes={got}-"
+            try:
+                req = urllib.request.Request(CUDA_WHEEL_URL, headers=headers)
+                with urllib.request.urlopen(req, timeout=DL_READ_TIMEOUT) as resp:
+                    # 服务端不支持续传会回 200，此时必须从头写，否则文件会损坏
+                    if got and resp.status != 206:
+                        got = 0
+                    clen = int(resp.headers.get("Content-Length") or 0)
+                    total = (got + clen) if clen else (remote_size or got)
+                    with _runtime_dl_lock:
+                        _runtime_dl_state.update(done=got, total=total, attempt=attempt)
+                    with tmp.open("ab" if got else "wb") as fh:
+                        while True:
+                            chunk = resp.read(DL_CHUNK)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            with _runtime_dl_lock:
+                                _runtime_dl_state["done"] += len(chunk)
+            except urllib.error.HTTPError as e:
+                if e.code == 416 and tmp.exists():
+                    # 断点位置超出远端文件（远端变小或换了文件）→ 丢掉半成品重来
+                    tmp.unlink()
+                    last_err = "断点已失效，重新开始下载"
+                    continue
+                last_err = f"{e}"
+                continue  # 断流：保留 .part，下一轮从断点继续
+            except Exception as e:
+                last_err = f"{e}"
+                continue
+            size = tmp.stat().st_size if tmp.exists() else 0
+            expected = remote_size or total
+            if expected and size != expected:
+                last_err = f"数据不完整（{size}/{expected} 字节）"
+                continue
+            tmp.replace(dest)  # 完整落盘后才改名，避免半成品被当成可用轮子
+            with _runtime_dl_lock:
+                _runtime_dl_state.update(active=False, ok=True, error="")
+            return
+
+        # 走到这里：要么是「已下满」跳出，要么是重试次数用尽
+        size = tmp.stat().st_size if tmp.exists() else 0
+        if remote_size and size == remote_size:
+            tmp.replace(dest)
+            with _runtime_dl_lock:
+                _runtime_dl_state.update(active=False, ok=True, error="")
+            return
+        raise RuntimeError(last_err or "多次重试后仍未完成")
+    except Exception as e:
+        # 保留 .part：下次点按钮可从断点续传，不必重下整个文件
+        kept = 0
+        try:
+            kept = tmp.stat().st_size if tmp.exists() else 0
+        except Exception:
+            kept = 0
+        hint = f"（已保留 {kept // 1048576} MB，下次将从断点继续）" if kept else ""
+        with _runtime_dl_lock:
+            _runtime_dl_state.update(active=False, ok=False, error=f"下载失败：{e}{hint}")
+
+
 # ---------- 卡片设置资料 JSON（按模型镜像存储，文件名加 _new 后缀） ----------
 # 结构：<models_json_data>/<LoRA相对路径同构目录>/<模型文件名>_new.json
 # 内容：哈希/大小（重定向锚点）、描述、基础模型、训练标签、触发词、
@@ -1785,6 +2005,56 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     def api_llm_download_status():
         with _download_lock:
             return {"ok": True, **_download_state}
+
+    @app.get("/lora_new/api/runtime_info")
+    def api_runtime_info(force: bool = False):
+        probe = _probe_runtime(force=bool(force))
+        nv_ok, nv_ver = _nvidia_ok()
+        return {
+            "ok": True,
+            "installed": probe["installed"],     # 是否装了 llama_cpp
+            "usable": probe["usable"],           # 是否能正常导入（装了但导不进来时为 False）
+            "build": probe["build"],             # "cuda" / "cpu" / ""
+            "version": RUNTIME_VERSION,
+            "cuda_wheel_ready": _cuda_wheel_downloaded(),
+            "nvidia_ok": nv_ok,
+            "driver": nv_ver,
+            "min_driver": ".".join(str(x) for x in MIN_CUDA_DRIVER),
+        }
+
+    @app.post("/lora_new/api/runtime_download_cuda")
+    def api_runtime_download_cuda():
+        if _cuda_wheel_downloaded():
+            return {"ok": True, "already": True}
+        nv_ok, nv_ver = _nvidia_ok()
+        if not nv_ok:
+            min_ver = ".".join(str(x) for x in MIN_CUDA_DRIVER)
+            hint = f"（当前驱动 {nv_ver}）" if nv_ver else ""
+            return {"ok": False, "error": f"未检测到可用的 NVIDIA 显卡或驱动版本过低，需 ≥ {min_ver}{hint}"}
+        with _runtime_dl_lock:
+            if _runtime_dl_state["active"]:
+                return {"ok": False, "error": "已有下载任务在进行中"}
+            # done 从已有 .part 的大小起算：续传时进度条直接从中断处继续
+            _runtime_dl_state.update(
+                active=True, ok=False, error="", done=_cuda_wheel_partial_size(), total=0, attempt=0,
+            )
+        threading.Thread(target=_cuda_wheel_worker, daemon=True, name="lna-cuda-wheel").start()
+        return {"ok": True}
+
+    @app.get("/lora_new/api/runtime_download_status")
+    def api_runtime_download_status():
+        with _runtime_dl_lock:
+            st = dict(_runtime_dl_state)
+        return {
+            "ok": True,
+            "active": st["active"],
+            "done": st["done"],
+            "total": st["total"],
+            "attempt": st["attempt"],
+            "error": st["error"],
+            "finished": st["ok"],           # 命名避开与请求状态 ok 冲突
+            "cuda_wheel_ready": _cuda_wheel_downloaded(),
+        }
 
     @app.post("/lora_new/api/user_metadata")
     async def api_user_metadata(payload: dict):

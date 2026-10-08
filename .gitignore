@@ -7,6 +7,11 @@ __pycache__/
 data/*.json
 models_json_data/
 
+# CUDA 版 llama-cpp-python 轮子由用户在设置里按需下载（约 490MB），不入库；
+# wheels/ 顶层的 CPU 轮子随插件分发，需要提交
+wheels/cuda/
+wheels/*.failed
+
 # ---- 内部开发文档（含个人机器绝对路径）----
 需求文档*.md
 项目现状概览*.md
