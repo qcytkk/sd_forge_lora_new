@@ -1,0 +1,18 @@
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- 运行期 / 用户数据（含本地 LoRA 路径与模型信息，不得公开）----
+data/*.json
+models_json_data/
+
+# ---- 内部开发文档（含个人机器绝对路径）----
+需求文档*.md
+项目现状概览*.md
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
