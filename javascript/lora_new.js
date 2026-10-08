@@ -292,6 +292,11 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
   }
+  // 预览图 URL：拼上后端返回的版本号（文件 mtime），替换/重新生成预览图后依旧取到新图而非旧缓存
+  function previewUrl(rel, ver) {
+    const base = `/lora_new_files/${encodeURI(rel)}`;
+    return ver ? `${base}?v=${encodeURIComponent(ver)}` : base;
+  }
   function fmtSize(bytes) {
     if (bytes == null) return '';
     if (bytes < 1024) return bytes + ' B';
@@ -681,7 +686,7 @@
     el.setAttribute('tabindex', '0');
     el.setAttribute('aria-label', `文件夹：${f.name}，按 Enter 打开`);
     // 与 LoRA 卡一致：受「卡片图像预览」开关控制，关闭时隐藏封面层露出占位层
-    const coverBg = state.showPreviews && f.preview ? `background-image:url('/lora_new_files/${encodeURI(f.preview)}')` : '';
+    const coverBg = state.showPreviews && f.preview ? `background-image:url('${previewUrl(f.preview, f.preview_ver)}')` : '';
     const coverStyle = coverBg + (state.showPreviews ? '' : 'display:none;');
     el.innerHTML = `
       <div class="lna-layer-base" aria-hidden="true">
@@ -728,7 +733,7 @@
     el.setAttribute('tabindex', '0');
     el.setAttribute('aria-label', `LoRA：${l.name}，大小 ${fmtSize(l.size)}，使用 ${l.usage_count} 次`);
     // 关闭「卡片图像预览」时不引用预览图，并隐藏封面层（z-index 2），露出「暂无封面」占位层（z-index 1）
-    const coverBg = state.showPreviews && l.preview ? `background-image:url('/lora_new_files/${encodeURI(l.preview)}')` : '';
+    const coverBg = state.showPreviews && l.preview ? `background-image:url('${previewUrl(l.preview, l.preview_ver)}')` : '';
     const coverStyle = coverBg + (state.showPreviews ? '' : 'display:none;');
     // 卡片描述层：仅在有描述时渲染，悬停时从底部升起展示（见 style.css .lna-layer-desc）
     // 外层 .lna-layer-desc 负责高度升起（block + overflow），内层负责文字多行截断（-webkit-box）
@@ -2524,13 +2529,63 @@
     return picked.sort().join(', ');
   }
 
+  // 取当前输出图库中「选中的」生成图像（无选中则取最后一张，即最新生成），返回图片 src
+  // 插件页是 Gradio Tab，会隐藏 Generation 面板，故直接按 id 取图库节点，不依赖可见性判断
+  function pickGeneratedImageSrc() {
+    const root = getActiveRoot();
+    const tabitem = root ? root.closest('.tabitem') : null;
+    const prefix = (tabitem && tabitem.id.indexOf('img2img') >= 0) ? 'img2img' : 'txt2img';
+    const gal = document.getElementById(`${prefix}_gallery`);
+    if (!gal) return null;
+    const thumbs = gal.querySelectorAll('.thumbnail-item');
+    if (!thumbs.length) return null;
+    const thumb = gal.querySelector('.thumbnail-item.selected') || thumbs[thumbs.length - 1];
+    const img = thumb.querySelector('img');
+    return img && img.src ? img.src : null;
+  }
+
+  // 参考内置 sd_forge_lora 的「替换预览图像」：把输出图库中选中的生成图像存为该卡片预览图
+  async function applyGeneratedPreview(endpoint, rel, scope, card) {
+    const src = pickGeneratedImageSrc();
+    if (!src) { flashToast('未找到生成图像，请先在输出图库中生成或选中一张'); return; }
+    let blob = null;
+    try {
+      const rr = await fetch(src);
+      blob = await rr.blob();
+    } catch (e) {
+      blob = null;
+    }
+    if (!blob || !blob.size) { flashToast('读取生成图像失败'); return; }
+    const fd = new FormData();
+    fd.append('file', blob, 'preview.png');
+    try {
+      const r = await fetch(`${endpoint}?rel=${encodeURIComponent(rel)}`, { method: 'POST', body: fd });
+      const res = await r.json();
+      if (res && res.ok) {
+        const pv = scope.querySelector('.lna-cf-preview');
+        if (pv) {
+          pv.classList.remove('is-empty');
+          pv.style.backgroundImage = `url('${previewUrl(res.preview, res.preview_ver)}')`;
+        }
+        card.preview = res.preview;
+        card.preview_ver = res.preview_ver;
+        renderAll(); // 同步卡片缩略图/封面
+        flashToast('已使用生成图像替换预览图');
+      } else {
+        flashToast('替换失败：' + ((res && res.error) || '未知错误'));
+      }
+    } catch (e) {
+      flashToast('替换失败：请求出错');
+    }
+  }
+
   function cardFormHtml(info) {
     const u = info.user || {};
     const weight = Number(u.preferred_weight) || 0;
     const curVer = u.base_model || info.sd_version || 'Unknown';
     const hasTags = !!(info.tags && info.tags.length); // 未记录训练标签的模型不显示翻译功能按钮
     const coverStyle = info.preview
-      ? ` style="background-image:url('/lora_new_files/${encodeURI(info.preview)}')"`
+      ? ` style="background-image:url('${previewUrl(info.preview, info.preview_ver)}')"`
       : '';
     return `
     <div class="lna-card-form">
@@ -2552,7 +2607,8 @@
           <div class="lna-cf-preview${info.preview ? '' : ' is-empty'}"${coverStyle}>
             <span class="lna-cf-preview-hint">暂无预览图</span>
           </div>
-          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">替换预览图像</button>
+          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">浏览并替换预览图像</button>
+          <button class="dlg-btn dlg-action lna-cf-use-gen" type="button" data-act="use-generated">将生成的图像作为预览图像</button>
         </div>
       </div>
       <div class="lna-cf-field">
@@ -2626,9 +2682,14 @@
 
         // 替换按钮在内容区、异步渲染后才出现，故用事件委托
         modal.addEventListener('click', (e) => {
-          if (!e.target.closest('[data-act="replace"]')) return;
-          if (!fileInput) { flashToast('卡片信息还在加载，请稍候'); return; }
-          fileInput.click();
+          if (e.target.closest('[data-act="replace"]')) {
+            if (!fileInput) { flashToast('卡片信息还在加载，请稍候'); return; }
+            fileInput.click();
+            return;
+          }
+          if (e.target.closest('[data-act="use-generated"]')) {
+            applyGeneratedPreview(API.preview, l.rel, modal, l);
+          }
         });
 
         modal.querySelector('[data-act="save"]').addEventListener('click', async () => {
@@ -2840,9 +2901,10 @@
           const pv = body.querySelector('.lna-cf-preview');
           if (pv) {
             pv.classList.remove('is-empty');
-            pv.style.backgroundImage = `url('/lora_new_files/${encodeURI(res.preview)}')`;
+            pv.style.backgroundImage = `url('${previewUrl(res.preview, res.preview_ver)}')`;
           }
           l.preview = res.preview;
+          l.preview_ver = res.preview_ver;
           renderAll(); // 同步卡片缩略图
           flashToast('预览图已替换');
         } else {
@@ -2858,7 +2920,7 @@
   // ---------- 文件夹卡片设置 ----------
   function folderFormHtml(info) {
     const coverStyle = info.preview
-      ? ` style="background-image:url('/lora_new_files/${encodeURI(info.preview)}')"`
+      ? ` style="background-image:url('${previewUrl(info.preview, info.preview_ver)}')"`
       : '';
     return `
     <div class="lna-card-form">
@@ -2878,7 +2940,8 @@
           <div class="lna-cf-preview${info.preview ? '' : ' is-empty'}"${coverStyle}>
             <span class="lna-cf-preview-hint">暂无预览图</span>
           </div>
-          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">替换预览图像</button>
+          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">浏览并替换预览图像</button>
+          <button class="dlg-btn dlg-action lna-cf-use-gen" type="button" data-act="use-generated">将生成的图像作为预览图像</button>
           <button class="dlg-btn dlg-action lna-cf-open" type="button" data-act="open-folder">打开文件夹路径</button>
         </div>
       </div>
@@ -2902,6 +2965,10 @@
           if (e.target.closest('[data-act="replace"]')) {
             if (!fileInput) { flashToast('文件夹信息还在加载，请稍候'); return; }
             fileInput.click();
+            return;
+          }
+          if (e.target.closest('[data-act="use-generated"]')) {
+            applyGeneratedPreview(API.folderPreview, f.rel, modal, f);
             return;
           }
           if (e.target.closest('[data-act="open-folder"]')) {
@@ -2967,9 +3034,10 @@
           const pv = body.querySelector('.lna-cf-preview');
           if (pv) {
             pv.classList.remove('is-empty');
-            pv.style.backgroundImage = `url('/lora_new_files/${encodeURI(res.preview)}')`;
+            pv.style.backgroundImage = `url('${previewUrl(res.preview, res.preview_ver)}')`;
           }
           f.preview = res.preview;
+          f.preview_ver = res.preview_ver;
           renderAll(); // 同步文件夹卡片封面
           flashToast('预览图已替换');
         } else {

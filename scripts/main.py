@@ -192,6 +192,17 @@ def _rel(p: Path) -> str:
     return str(p.relative_to(LORA_DIR)).replace("\\", "/")
 
 
+def _preview_ver(rel: str | None) -> int:
+    """预览图版本号（文件 mtime 纳秒）。前端把它拼到图片 URL 后，替换/重新生成预览图后
+    浏览器不会再命中旧缓存；读取失败返回 0 表示「无版本」。"""
+    if not rel:
+        return 0
+    try:
+        return (LORA_DIR / rel).stat().st_mtime_ns
+    except Exception:
+        return 0
+
+
 def _safe_rel(rel: str) -> str:
     """清洗相对路径，阻止 .. 目录穿越；非法则回退到根目录。"""
     if not rel:
@@ -218,6 +229,7 @@ def _lora_entry(e: Path) -> dict | None:
         "created": st.st_ctime,
         "modified": st.st_mtime,
         "preview": preview,
+        "preview_ver": _preview_ver(preview),
         "trigger": _read_trigger(e.parent, e.stem),
         "description": _get_card_desc(rel_key),
         "usage_count": _stats["usage_count"].get(rel_key, 0),
@@ -313,7 +325,8 @@ def list_dir(rel: str = "") -> dict:
     entries = sorted(abs_dir.iterdir(), key=lambda x: x.name.lower())
     for e in entries:
         if e.is_dir():
-            folders.append({"name": e.name, "rel": _rel(e), "preview": _find_folder_preview(e)})
+            pv = _find_folder_preview(e)
+            folders.append({"name": e.name, "rel": _rel(e), "preview": pv, "preview_ver": _preview_ver(pv)})
         elif e.suffix.lower() in LORA_EXTS:
             item = _lora_entry(e)
             if item:
@@ -340,7 +353,8 @@ def search_all(rel: str, query: str) -> dict:
             for d in dirs:
                 if not q or q in d.lower():
                     d_path = root_path / d
-                    folders.append({"name": d, "rel": _rel(d_path), "preview": _find_folder_preview(d_path)})
+                    pv = _find_folder_preview(d_path)
+                    folders.append({"name": d, "rel": _rel(d_path), "preview": pv, "preview_ver": _preview_ver(pv)})
             # LoRA 文件名匹配
             for fn in sorted(files, key=lambda x: x.lower()):
                 p = root_path / fn
@@ -557,11 +571,13 @@ def card_info(rel: str) -> dict:
 
     zh_map = user.get("translations")
     zh_map = zh_map.get("zh", {}) if isinstance(zh_map, dict) else {}
+    preview = _stats["custom_previews"].get(safe) or _find_preview(path.parent, path.stem)
     return {
         "ok": True,
         "rel": safe,
         "name": path.stem,
-        "preview": _stats["custom_previews"].get(safe) or _find_preview(path.parent, path.stem),
+        "preview": preview,
+        "preview_ver": _preview_ver(preview),
         "table": table,
         "tags": tags,
         "sd_version": _detect_sd_version(meta),
@@ -576,13 +592,15 @@ def folder_info(rel: str) -> dict:
     abs_dir = (LORA_DIR / safe) if safe else LORA_DIR
     if not abs_dir.is_dir():
         return {"ok": False, "error": "文件夹不存在"}
+    pv = _find_folder_preview(abs_dir)
     return {
         "ok": True,
         "rel": safe,
         "name": abs_dir.name,
         "path": str(abs_dir),
         "count": _count_loras_recursive(abs_dir),
-        "preview": _find_folder_preview(abs_dir),
+        "preview": pv,
+        "preview_ver": _preview_ver(pv),
         "description": str(_get_card_data(safe).get("description", "")),
     }
 
@@ -1829,7 +1847,8 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             return {"ok": False, "error": f"写入失败：{e}"}
         _stats["custom_previews"].pop(safe, None)
         _save_stats()
-        return {"ok": True, "preview": _rel(target)}
+        rel_out = _rel(target)
+        return {"ok": True, "preview": rel_out, "preview_ver": _preview_ver(rel_out)}
 
     @app.post("/lora_new/api/folder_preview")
     async def api_folder_preview(rel: str = "", file: UploadFile = File(...)):
@@ -1860,7 +1879,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             target.write_bytes(data)
         except Exception as e:
             return {"ok": False, "error": f"写入失败：{e}"}
-        return {"ok": True, "preview": _rel(target)}
+        return {"ok": True, "preview": _rel(target), "preview_ver": _preview_ver(_rel(target))}
 
     @app.get("/lora_new/api/dict_lookup")
     def api_dict_lookup(tag: str = ""):

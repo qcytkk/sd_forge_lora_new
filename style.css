@@ -921,7 +921,7 @@ body.dark .lna-dialog .dlg-btn.dlg-action:hover {
   border-color: #c2410c;
   color: #fff;
 }
-/* 预览图下方的「替换预览图像」按钮 */
+/* 预览图下方的「浏览并替换预览图像」按钮 */
 .lna-dialog .lna-cf-replace { width: 100%; margin-top: 10px; }
 /* 人工修正译文：蓝色文字 + 蓝色描边，悬停蓝底白字（与橙色系动作按钮区分） */
 .lna-dialog .dlg-btn.lna-cf-zh-edit {
@@ -942,6 +942,8 @@ body.dark .lna-dialog .dlg-btn.lna-cf-zh-edit {
 }
 /* 替换按钮下方的「打开文件夹路径」按钮 */
 .lna-dialog .lna-cf-open { width: 100%; margin-top: 8px; }
+/* 「浏览并替换预览图像」下方的「将生成的图像作为预览图像」按钮 */
+.lna-dialog .lna-cf-use-gen { width: 100%; margin-top: 8px; }
 /* 文件夹设置：描述下方的信息列表与描述输入框留出间距 */
 .lna-dialog .lna-cf-info { margin-top: 14px; }
 
