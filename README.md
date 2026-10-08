@@ -19,7 +19,7 @@ Stable Diffusion WebUI Forge 的 **LoRA 管理器** 插件。以「LoRA 管理�
 
 ```bash
 cd <你的 WebUI 根目录>/extensions
-git clone https://github.com/<你的GitHub用户名>/sd_forge_lora_new.git
+git clone https://github.com/qcytkk/sd_forge_lora_new.git
 ```
 
 然后重启 WebUI。启动后在 txt2img / img2img 页面下方即可看到「LoRA 管理器」页面。
