@@ -106,11 +106,18 @@ def _prepare_dll_env() -> None:
     if os.name != "nt":
         return
     dirs: list[str] = []
+    # WebUI 自带的 torch 里有 CUDA 12 运行库（cudart64_12 / cublas64_12 / cublasLt64_12）。
+    # 用 find_spec 定位而不 import torch：同样能拿到目录，且避免每次启动都付几秒的导入开销。
     try:
-        import torch  # cpu_supports_avx2() 已导入过，这里基本无额外开销
-
-        tlib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        if os.path.isdir(tlib):
+        spec = importlib.util.find_spec("torch")
+        base = None
+        if spec is not None:
+            if spec.submodule_search_locations:
+                base = list(spec.submodule_search_locations)[0]
+            elif spec.origin:
+                base = os.path.dirname(spec.origin)
+        tlib = os.path.join(base, "lib") if base else ""
+        if tlib and os.path.isdir(tlib):
             dirs.append(tlib)
     except Exception:
         pass
@@ -227,30 +234,40 @@ def remove_quiet(path: str) -> None:
 
 
 def main() -> None:
-    _prepare_dll_env()  # CUDA 版轮子依赖 cudart/cublas：先把 DLL 搜索路径补好再校验
+    _prepare_dll_env()  # 很便宜：只查目录、拼 PATH，供 CUDA 版轮子加载 cudart/cublas
+
+    cuda_wheel = pick_cuda_wheel()
+    installed = already_installed()
+    ok = verify_import()[0] if installed else False
+
+    # 每次启动留一行结论：排查问题时一眼能看出走到哪一步、为什么没装
+    _log("运行时检查：已安装={0}、可正常导入={1}、wheels/cuda 待装轮子={2}".format(
+        "是" if installed else "否", "是" if ok else "否", "有" if cuda_wheel else "无"))
+
+    if cuda_wheel is None and ok:
+        return  # 已经能用了，且没有新轮子要装
 
     if cpu_supports_avx2() is False:
         _log("当前 CPU 不支持 AVX2，跳过安装（预编译轮子会崩溃，标签翻译将仅使用内置词典）")
         return
 
     # 1) 用户已下载 CUDA 轮子 → 优先强装（CUDA 版自带 CPU 后端，GPU/CPU 都可用）
-    cuda_wheel = pick_cuda_wheel()
     if cuda_wheel is not None:
         try:
             if install_wheel(cuda_wheel) == 0:
-                ok, why = verify_import()
-                if ok:
+                ok2, why2 = verify_import()
+                if ok2:
                     remove_quiet(cuda_wheel)  # 装好即删，避免每次启动重复强装
                     _log("已安装 CUDA 版 llama-cpp-python（GPU 优先，显存不足时自动改用 CPU）")
                     return
-                _log(f"CUDA 版安装后无法导入：{why}")
+                _log(f"CUDA 版安装后无法导入：{why2}")
         except Exception as e:
             _log(f"CUDA 版安装失败：{e}")
         quarantine(cuda_wheel)
         _log("CUDA 版不可用，改用 CPU 版")
 
-    # 2) 已装且能正常导入 → 不动
-    if already_installed() and verify_import()[0]:
+    # 2) 仍然可用（含上面的失败回退后依旧可用）→ 不动
+    if ok:
         return
 
     # 3) CPU 版保底（本地零网络优先）
