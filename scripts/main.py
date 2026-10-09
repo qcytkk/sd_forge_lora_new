@@ -2182,13 +2182,18 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
 
     @app.post("/lora_new/api/dict_check")
     async def api_dict_check(payload: dict):
-        """批量查询多个标签是否已收录词典，供「将译文加入词典」弹窗统一着色。"""
+        """批量查询多个标签的词典收录情况：返回是否命中及其现值，
+        供「将译文加入词典」弹窗判断标签该显示绿/黄橙/红。"""
         tags = payload.get("tags") or []
         if not isinstance(tags, list):
             return {"ok": False, "error": "参数格式错误"}
         _load_tag_dict()
-        found = {str(t): _normalize_tag(str(t)) in _tag_dict for t in tags}
-        return {"ok": True, "found": found}
+        result = {}
+        for t in tags:
+            t = str(t)
+            key = _normalize_tag(t)
+            result[t] = {"found": key in _tag_dict, "value": _tag_dict.get(key, "")}
+        return {"ok": True, "dict": result}
 
     @app.get("/lora_new/api/ui_settings")
     def api_ui_settings_get():

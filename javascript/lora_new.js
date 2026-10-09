@@ -981,9 +981,7 @@
                   <span class="lna-switch-name">翻译方案</span>
                   <span class="lna-switch-desc">混合翻译：先查内置翻译词典，未收录的标签再用 GGUF 模型翻译；仅用翻译词典则不调用模型，未收录的标签显示「未完成翻译」。</span>
                 </span>
-                <div class="lna-mode-group" role="group" aria-label="标签翻译方案">
-                  ${TRANS_MODES.map((x) => `<button class="lna-mode-btn${x.v === TRANS_MODE_DEFAULT ? ' active' : ''}" type="button" data-mode="${x.v}" aria-pressed="${x.v === TRANS_MODE_DEFAULT ? 'true' : 'false'}">${x.label}</button>`).join('')}
-                </div>
+                ${modeGroupHtml()}
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
@@ -1397,18 +1395,52 @@
   }
 
   // 翻译方案：仅用对照表 / 仅用模型翻译 / 使用混合翻译
-  function syncModeSwitch(modal, mode) {
+  function syncModeSwitch(root, mode) {
     const m = TRANS_MODES.some((x) => x.v === mode) ? mode : TRANS_MODE_DEFAULT;
-    modal.querySelectorAll('.lna-mode-btn').forEach((b) => {
+    root.querySelectorAll('.lna-mode-btn').forEach((b) => {
       const on = b.dataset.mode === m;
       b.classList.toggle('active', on);
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
   }
 
+  // 翻译方案控件 HTML：插件设置与卡片设置共用同一套按钮结构
+  function modeGroupHtml() {
+    return `<div class="lna-mode-group" role="group" aria-label="标签翻译方案">${TRANS_MODES.map((x) => `<button class="lna-mode-btn${x.v === TRANS_MODE_DEFAULT ? ' active' : ''}" type="button" data-mode="${x.v}" aria-pressed="${x.v === TRANS_MODE_DEFAULT ? 'true' : 'false'}">${x.label}</button>`).join('')}</div>`;
+  }
+
   function modeLabel(mode) {
     const hit = TRANS_MODES.find((x) => x.v === mode);
     return hit ? hit.label : String(mode || '');
+  }
+
+  // 绑定翻译方案按钮：写入后端后同步「文档内所有」方案控件，
+  // 使插件设置与卡片设置两处控件始终一致（共享同一后端值）。
+  function bindModeSwitch(root) {
+    root.querySelectorAll('.lna-mode-btn').forEach((b) => {
+      b.addEventListener('click', async () => {
+        if (b.classList.contains('active')) return;
+        const want = b.dataset.mode;
+        try {
+          const r = await fetch(API.translateMode, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: want }),
+          });
+          const res = await r.json();
+          if (res && res.ok) {
+            syncModeSwitch(document, res.mode);
+            flashToast('已切换为「' + modeLabel(res.mode) + '」');
+          } else {
+            flashToast('保存失败：' + ((res && res.error) || '未知错误'), true);
+            await refreshTranslateMode(root); // 回滚为后端真实值
+          }
+        } catch (e) {
+          flashToast('保存失败：请求出错', true);
+          await refreshTranslateMode(root);
+        }
+      });
+    });
   }
 
   // 读取后端当前翻译方案并同步到弹窗
@@ -1748,31 +1780,8 @@
       });
     });
 
-    // 翻译方案切换：保存到后端（翻译时按该方案执行）
-    modal.querySelectorAll('.lna-mode-btn').forEach((b) => {
-      b.addEventListener('click', async () => {
-        if (b.classList.contains('active')) return;
-        const want = b.dataset.mode;
-        try {
-          const r = await fetch(API.translateMode, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode: want }),
-          });
-          const res = await r.json();
-          if (res && res.ok) {
-            syncModeSwitch(modal, res.mode);
-            flashToast('已切换为「' + modeLabel(res.mode) + '」');
-          } else {
-            flashToast('保存失败：' + ((res && res.error) || '未知错误'), true);
-            await refreshTranslateMode(modal); // 回滚为后端真实值
-          }
-        } catch (e) {
-          flashToast('保存失败：请求出错', true);
-          await refreshTranslateMode(modal);
-        }
-      });
-    });
+    // 翻译方案切换：保存到后端（翻译时按该方案执行），并与卡片设置处的同名控件同步
+    bindModeSwitch(modal);
 
     // 空闲自动卸载：胶囊开关与分钟输入框
     const idleInp = modal.querySelector('.lna-idle-minutes');
@@ -2359,10 +2368,18 @@
         </div>`;
   }
 
-  // 【将译文加入词典】弹窗专用：把窗口内所有标签与词典全量比对，
-  // 已收录 → 绿色、未收录 → 红色（靠 .lna-dict-tags 限定，仅本窗口生效）。
-  // 比对完成前保持中性灰；请求失败时不着色，避免误判成「全部未收录」。
-  async function markDictMatches(root) {
+  // 译文归一化：折叠空白后比较，避免「短袖 」与「短袖」被判成不同
+  function normZh(s) {
+    return String(s == null ? '' : s).trim().replace(/\s+/g, ' ');
+  }
+
+  // 【将译文加入词典】弹窗专用：把窗口内所有标签与词典全量比对并着色——
+  //   已收录且与当前译文一致 → green（.is-matched）
+  //   已收录但与当前译文不同 → 黄橙（.is-diff）
+  //   未收录 → 红色（默认，即不加上述类）
+  // 靠 .lna-dict-tags 限定作用域，仅本窗口生效；比对完成前保持中性灰，
+  // 请求失败时不着色，避免误判成「全部未收录」。
+  async function markDictMatches(root, zhMap) {
     const box = root.querySelector('.lna-dict-tags');
     if (!box) return;
     const btns = Array.from(box.querySelectorAll('.lna-tag'));
@@ -2374,18 +2391,26 @@
         body: JSON.stringify({ tags: btns.map((b) => b.dataset.tag) }),
       });
       const j = await r.json();
-      if (!j || !j.ok || !j.found || !document.contains(root)) return;
-      btns.forEach((b) => b.classList.toggle('is-matched', !!j.found[b.dataset.tag]));
+      if (!j || !j.ok || !j.dict || !document.contains(root)) return;
+      btns.forEach((b) => {
+        const d = j.dict[b.dataset.tag] || {};
+        // 与弹窗内 has-zh 判定保持一致：译文等于标签本身时视为「无译文」
+        const raw = zhMap && zhMap[b.dataset.tag];
+        const cur = raw && raw !== b.dataset.tag ? normZh(raw) : '';
+        const same = d.found && cur && normZh(d.value) === cur;
+        b.classList.toggle('is-matched', !!same);
+        b.classList.toggle('is-diff', !!d.found && !same);
+      });
       box.classList.add('is-checked');
     } catch (e) { /* 比对失败：保持中性灰 */ }
   }
 
-  // 单个标签写入词典成功后，就地把它改为「已收录」绿色（仅本窗口）
+  // 单个标签写入词典成功后，就地把它改为「已收录且与译文一致」的绿色（仅本窗口）
   function markDictMatched(root, tag) {
     const box = root.querySelector('.lna-dict-tags');
     if (box) box.classList.add('is-checked');
     root.querySelectorAll('.lna-dict-tags .lna-tag').forEach((b) => {
-      if (b.dataset.tag === tag) b.classList.add('is-matched');
+      if (b.dataset.tag === tag) { b.classList.add('is-matched'); b.classList.remove('is-diff'); }
     });
   }
 
@@ -2438,8 +2463,8 @@
       if (zh && zh !== btn.dataset.tag) { span.textContent = zh; btn.classList.add('has-zh'); }
       else btn.classList.add('no-zh');
     });
-    // 打开后全量比对词典：已收录 → 绿、未收录 → 红（仅本窗口）
-    markDictMatches(dlg);
+    // 打开后全量比对词典：一致 → 绿、有差异 → 黄橙、未收录 → 红（仅本窗口）
+    markDictMatches(dlg, zhMap);
 
     let closed = false;
     function close() {
@@ -2471,10 +2496,13 @@
       const dictVal = lookup.dict_value || '';
       const canWrite = !!zhText;
       const btnLabel = lookup.found ? '替换词典译文' : '添加到词典';
+      // 「词典匹配」行配色：已收录且与当前译文一致 → 绿；已收录但与译文不同 → 黄橙；未收录 → 红
+      const same = !!zhText && normZh(zhText) === normZh(dictVal);
+      const matchHtml = !lookup.found
+        ? '<b class="lna-dict-miss">未收录（词典中没有该标签）</b>'
+        : `<span class="${same ? 'lna-dict-hit' : 'lna-dict-diff'}">已收录，现值：<b>${esc(dictVal)}</b></span>`;
       // 两行布局：行1=标签+当前译文，行2=词典匹配+按钮（按钮固定右端，避免文案长短变化导致按钮跳动）
-      resultBox.innerHTML = dictSkeleton(tag, zhText, lookup.found
-        ? `<span class="lna-dict-hit">已收录，现值：<b>${esc(dictVal)}</b></span>`
-        : '<b class="lna-dict-miss">未收录（词典中没有该标签）</b>', btnLabel, canWrite);
+      resultBox.innerHTML = dictSkeleton(tag, zhText, matchHtml, btnLabel, canWrite);
       const saveBtn = resultBox.querySelector('.lna-dict-save');
       if (saveBtn) {
         saveBtn.addEventListener('click', async () => {
@@ -2790,6 +2818,7 @@
             <button class="lna-zh-key${state.showTagZh ? '' : ' active'}" type="button" data-zh="0" aria-pressed="${state.showTagZh ? 'false' : 'true'}">隐藏翻译</button>
             <button class="lna-zh-key${state.showTagZh ? ' active' : ''}" type="button" data-zh="1" aria-pressed="${state.showTagZh ? 'true' : 'false'}">显示翻译</button>
           </div>
+          ${modeGroupHtml()}
           <button class="dlg-btn dlg-action lna-cf-zh-all" type="button" title="批量翻译当前卡片的全部训练标签">${ICON.translateAll}<span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-all-label">翻译所有标签</span></button>
           <button class="dlg-btn dlg-action lna-cf-zh-missing" type="button" title="只翻译当前还没有中文对照的标签（已有对照的沿用，不调用模型）">${ICON.incomplete}<span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-missing-label">翻译未完成标签</span></button>
           <button class="dlg-btn dlg-action lna-cf-zh-pick" type="button" title="勾选训练标签后重新翻译（跳过缓存，覆盖旧译文）">${ICON.retranslate}选择标签重新翻译</button>
@@ -2947,6 +2976,11 @@
         syncTagZhVisible(body); // 纯显示切换，不触发翻译
       });
     });
+    // 翻译方案切换控件：与插件设置处的同名控件共享后端值，双向同步
+    if (body.querySelector('.lna-mode-btn')) {
+      bindModeSwitch(dlg);
+      refreshTranslateMode(dlg);
+    }
     // 翻译按钮通用流程：忙碌态 + 计时 + 完成后自动开启译文显示
     const zhTime = body.querySelector('.lna-zh-time');
     function bindZhButton(btn, labelSel, idleLabel, getTags, emptyMsg) {

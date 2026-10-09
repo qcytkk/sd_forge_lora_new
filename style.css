@@ -940,6 +940,40 @@ body.dark .lna-dialog .dlg-btn.lna-cf-zh-edit {
   border-color: #60a5fa;
   color: #93c5fd;
 }
+/* 「翻译所有标签」：橙色描边 + 橙色文字/图标，悬停橙底白字（图标为 currentColor 自动跟随） */
+.lna-dialog .dlg-btn.lna-cf-zh-all {
+  background: transparent;
+  border-color: #ea580c;
+  color: #c2410c;
+}
+.lna-dialog .dlg-btn.lna-cf-zh-all:hover,
+body.dark .lna-dialog .dlg-btn.lna-cf-zh-all:hover {
+  background: #c2410c;
+  border-color: #c2410c;
+  color: #fff;
+}
+body.dark .lna-dialog .dlg-btn.lna-cf-zh-all {
+  background: transparent;
+  border-color: #fb923c;
+  color: #fdba74;
+}
+/* 「将译文加入词典」：绿色描边 + 绿色文字/图标，悬停绿底白字 */
+.lna-dialog .dlg-btn.lna-cf-dict {
+  background: transparent;
+  border-color: #16a34a;
+  color: #15803d;
+}
+.lna-dialog .dlg-btn.lna-cf-dict:hover,
+body.dark .lna-dialog .dlg-btn.lna-cf-dict:hover {
+  background: #15803d;
+  border-color: #15803d;
+  color: #fff;
+}
+body.dark .lna-dialog .dlg-btn.lna-cf-dict {
+  background: transparent;
+  border-color: #4ade80;
+  color: #86efac;
+}
 /* 替换按钮下方的「打开文件夹路径」按钮 */
 .lna-dialog .lna-cf-open { width: 100%; margin-top: 8px; }
 /* 「浏览并替换预览图像」下方的「将生成的图像作为预览图像」按钮 */
@@ -1387,6 +1421,8 @@ body.dark .lna-dialog .lna-cf-preview-hint { color: #9ca3af; }
   margin-top: 10px;
 }
 .lna-dialog .lna-cf-tags-actions .dlg-btn { height: 32px; padding: 0 14px; }
+/* 翻译方案控件与同行按钮/胶囊等高，保持垂直居中对齐 */
+.lna-dialog .lna-cf-tags-actions .lna-mode-btn { height: 32px; }
 /* 翻译功能按钮内嵌的 SVG 图标：扁平单色，仅取形状，颜色沿用插件主题（currentColor） */
 .lna-dialog .lna-cf-tags-actions .dlg-btn .lna-ico {
   width: 16px;
@@ -1515,11 +1551,14 @@ body.dark .lna-dialog .lna-dict-k { color: #9ca3af; }
 .lna-dialog .lna-dict-v { color: #1f2937; word-break: break-all; }
 body.dark .lna-dialog .lna-dict-v { color: #f3f4f6; }
 .lna-dialog .lna-dict-none { color: #9ca3af; font-style: italic; }
-/* 已收录提示用绿色：与琥珀色的「未收录」区分，方便与当前译文对比 */
+/* 「词典匹配」三态配色（与标签三态一致）：
+   已收录且译文一致 → 绿；已收录但有差异 → 黄橙；未收录 → 红 */
 .lna-dialog .lna-dict-hit { color: #15803d; }
 body.dark .lna-dialog .lna-dict-hit { color: #4ade80; }
-.lna-dialog .lna-dict-miss { color: #b45309; }
-body.dark .lna-dialog .lna-dict-miss { color: #fbbf24; }
+.lna-dialog .lna-dict-diff { color: #b45309; }
+body.dark .lna-dialog .lna-dict-diff { color: #fbbf24; }
+.lna-dialog .lna-dict-miss { color: #b91c1c; }
+body.dark .lna-dialog .lna-dict-miss { color: #f87171; }
 .lna-dialog .lna-dict-save.busy {
   background: #c2410c;
   border-color: #c2410c;
@@ -1689,19 +1728,27 @@ body.dark .lna-dialog .lna-cf-tags.show-zh .lna-tag.is-on.no-zh .lna-tag-zh { co
 /* 显示译文后标签变高，容器同步放宽 */
 .lna-dialog .lna-cf-tags.show-zh { max-height: 260px; }
 
-/* 【将译文加入词典】弹窗：标签底色按「是否已收录词典」统一着色——
-   已收录 → 绿色，未收录 → 红色（由 .lna-dict-tags 限定作用域，其它弹窗的彩色标签不受影响）。
+/* 【将译文加入词典】弹窗：标签底色按「与词典的匹配情况」三态着色——
+   已收录且与当前译文一致 → 绿，已收录但与译文不同 → 黄橙，未收录 → 红
+   （由 .lna-dict-tags 限定作用域，其它弹窗的彩色标签不受影响）。
    比对完成前（无 .is-checked）保持中性灰；选中的 .is-on 维持橙色高亮，不参与着色。 */
 .lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag:not(.is-on) {
   background: #fee2e2;
-  color: #991b1b;                /* 深红字压浅红底：对比度 >= 7:1 */
+  color: #991b1b;                /* 未收录：深红字压浅红底，对比度 >= 7:1 */
 }
 .lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag:not(.is-on) .lna-tag-count {
   background: #991b1b;
 }
+.lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag.is-diff:not(.is-on) {
+  background: #fef3c7;
+  color: #92400e;                /* 有差异：深琥珀字压浅琥珀底，对比度 >= 7:1 */
+}
+.lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag.is-diff:not(.is-on) .lna-tag-count {
+  background: #92400e;
+}
 .lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag.is-matched:not(.is-on) {
   background: #dcfce7;
-  color: #166534;                /* 深绿字压浅绿底：对比度 >= 7:1 */
+  color: #166534;                /* 与词典一致：深绿字压浅绿底，对比度 >= 7:1 */
 }
 .lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag.is-matched:not(.is-on) .lna-tag-count {
   background: #166534;
