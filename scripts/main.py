@@ -2180,6 +2180,16 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     async def api_dict_upsert(payload: dict):
         return _dict_upsert(str(payload.get("tag", "")), str(payload.get("value", "")))
 
+    @app.post("/lora_new/api/dict_check")
+    async def api_dict_check(payload: dict):
+        """批量查询多个标签是否已收录词典，供「将译文加入词典」弹窗统一着色。"""
+        tags = payload.get("tags") or []
+        if not isinstance(tags, list):
+            return {"ok": False, "error": "参数格式错误"}
+        _load_tag_dict()
+        found = {str(t): _normalize_tag(str(t)) in _tag_dict for t in tags}
+        return {"ok": True, "found": found}
+
     @app.get("/lora_new/api/ui_settings")
     def api_ui_settings_get():
         with _ui_settings_lock:

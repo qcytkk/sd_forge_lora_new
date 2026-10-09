@@ -1689,6 +1689,24 @@ body.dark .lna-dialog .lna-cf-tags.show-zh .lna-tag.is-on.no-zh .lna-tag-zh { co
 /* 显示译文后标签变高，容器同步放宽 */
 .lna-dialog .lna-cf-tags.show-zh { max-height: 260px; }
 
+/* 【将译文加入词典】弹窗：标签底色按「是否已收录词典」统一着色——
+   已收录 → 绿色，未收录 → 红色（由 .lna-dict-tags 限定作用域，其它弹窗的彩色标签不受影响）。
+   比对完成前（无 .is-checked）保持中性灰；选中的 .is-on 维持橙色高亮，不参与着色。 */
+.lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag:not(.is-on) {
+  background: #fee2e2;
+  color: #991b1b;                /* 深红字压浅红底：对比度 >= 7:1 */
+}
+.lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag:not(.is-on) .lna-tag-count {
+  background: #991b1b;
+}
+.lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag.is-matched:not(.is-on) {
+  background: #dcfce7;
+  color: #166534;                /* 深绿字压浅绿底：对比度 >= 7:1 */
+}
+.lna-dialog .lna-cf-tags.lna-dict-tags.is-checked .lna-tag.is-matched:not(.is-on) .lna-tag-count {
+  background: #166534;
+}
+
 /* 推荐权重 */
 .lna-dialog .lna-cf-weight { display: flex; align-items: center; gap: 12px; }
 .lna-dialog .lna-cf-weight-range { flex: 1 1 auto; accent-color: #ea580c; }

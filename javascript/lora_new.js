@@ -38,6 +38,7 @@
     view: '/lora_new/api/view',
     dictLookup: '/lora_new/api/dict_lookup',
     dictUpsert: '/lora_new/api/dict_upsert',
+    dictCheck: '/lora_new/api/dict_check',
     tagTranslation: '/lora_new/api/tag_translation',
     uiSettings: '/lora_new/api/ui_settings',
   };
@@ -2064,13 +2065,16 @@
     ['#fce7f3', '#9d174d'],
   ];
 
-  function tagsHtml(tags, tipText) {
+  function tagsHtml(tags, tipText, opts) {
     if (!tags || !tags.length) return '<span class="lna-cf-empty">（该模型未记录训练标签）</span>';
+    // plain=true：【将译文加入词典】弹窗专用，不下发彩色底，底色改由 CSS 按「是否已收录」统一分配
+    const plain = !!(opts && opts.plain);
     return tags.map(([tag, cnt], i) => {
       const [bg, fg] = TAG_PALETTE[i % TAG_PALETTE.length];
       // .lna-tag-row 保持原有的「英文标签 + 计数」横排；.lna-tag-zh 为中文翻译（默认隐藏）
       const tip = tipText || '点击添加/移除触发词';
-      return `<button class="lna-tag" type="button" data-tag="${esc(tag)}" aria-pressed="false" title="${esc(tip)}" style="--lna-tag-bg:${bg};--lna-tag-count-bg:${fg}"><span class="lna-tag-row"><span class="lna-tag-text">${esc(tag)}</span><span class="lna-tag-count">${esc(cnt)}</span></span><span class="lna-tag-zh"></span></button>`;
+      const style = plain ? '' : ` style="--lna-tag-bg:${bg};--lna-tag-count-bg:${fg}"`;
+      return `<button class="lna-tag" type="button" data-tag="${esc(tag)}" aria-pressed="false" title="${esc(tip)}"${style}><span class="lna-tag-row"><span class="lna-tag-text">${esc(tag)}</span><span class="lna-tag-count">${esc(cnt)}</span></span><span class="lna-tag-zh"></span></button>`;
     }).join('');
   }
 
@@ -2355,6 +2359,36 @@
         </div>`;
   }
 
+  // 【将译文加入词典】弹窗专用：把窗口内所有标签与词典全量比对，
+  // 已收录 → 绿色、未收录 → 红色（靠 .lna-dict-tags 限定，仅本窗口生效）。
+  // 比对完成前保持中性灰；请求失败时不着色，避免误判成「全部未收录」。
+  async function markDictMatches(root) {
+    const box = root.querySelector('.lna-dict-tags');
+    if (!box) return;
+    const btns = Array.from(box.querySelectorAll('.lna-tag'));
+    if (!btns.length) return;
+    try {
+      const r = await fetch(API.dictCheck, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tags: btns.map((b) => b.dataset.tag) }),
+      });
+      const j = await r.json();
+      if (!j || !j.ok || !j.found || !document.contains(root)) return;
+      btns.forEach((b) => b.classList.toggle('is-matched', !!j.found[b.dataset.tag]));
+      box.classList.add('is-checked');
+    } catch (e) { /* 比对失败：保持中性灰 */ }
+  }
+
+  // 单个标签写入词典成功后，就地把它改为「已收录」绿色（仅本窗口）
+  function markDictMatched(root, tag) {
+    const box = root.querySelector('.lna-dict-tags');
+    if (box) box.classList.add('is-checked');
+    root.querySelectorAll('.lna-dict-tags .lna-tag').forEach((b) => {
+      if (b.dataset.tag === tag) b.classList.add('is-matched');
+    });
+  }
+
   // 选中标签后查询后端词典：命中 → 【替换词典译文】；未命中 → 【添加到词典】。
   // 写入内容 = 该标签在卡片里的当前译文（__lnaZhMap）；无译文时按钮禁用并提示先翻译。
   function openDictDialog(body, info) {
@@ -2385,7 +2419,7 @@
       </header>
       <div class="dlg-body">
         <div class="lna-cf-field">
-          <div class="lna-cf-tags show-zh">${tagsHtml(info.tags, '点击选择要写入词典的标签（单选）')}</div>
+          <div class="lna-cf-tags show-zh lna-dict-tags">${tagsHtml(info.tags, '点击选择要写入词典的标签（单选）', { plain: true })}</div>
         </div>
         <div class="lna-dict-result" role="status" aria-live="polite">${emptyResultHtml}
         </div>
@@ -2404,6 +2438,8 @@
       if (zh && zh !== btn.dataset.tag) { span.textContent = zh; btn.classList.add('has-zh'); }
       else btn.classList.add('no-zh');
     });
+    // 打开后全量比对词典：已收录 → 绿、未收录 → 红（仅本窗口）
+    markDictMatches(dlg);
 
     let closed = false;
     function close() {
@@ -2456,6 +2492,7 @@
             const res = await r.json();
             if (res && res.ok) {
               flashToast(lookup.found ? `已替换词典对照：${tag}` : `已添加到词典：${tag}`);
+              markDictMatched(dlg, tag); // 写入成功 → 该标签样式更新为「已收录」绿色
               if (selected === tag) renderResult(tag, zhText, { ok: true, key: res.key, found: true, dict_value: res.value });
             } else {
               flashToast('写入失败：' + ((res && res.error) || '未知错误'), true);
