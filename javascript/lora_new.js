@@ -41,6 +41,11 @@
     dictCheck: '/lora_new/api/dict_check',
     tagTranslation: '/lora_new/api/tag_translation',
     uiSettings: '/lora_new/api/ui_settings',
+    matchOldData: '/lora_new/api/match_old_data',
+    syncOldJson: '/lora_new/api/sync_old_json',
+    syncOldJsonOverwrite: '/lora_new/api/sync_old_json_overwrite',
+    syncOldJsonCompare: '/lora_new/api/sync_old_json_compare',
+    syncOldJsonUnify: '/lora_new/api/sync_old_json_unify',
   };
 
   const SORT_OPTIONS = [
@@ -1084,6 +1089,33 @@
                 <textarea class="lna-cf-input lna-prompt-text" rows="7" spellcheck="false" aria-label="预设提示文本"></textarea>
                 <div class="lna-prompt-msg" role="status" aria-live="polite" hidden></div>
               </div>
+            </div>
+            <div class="lna-set-group">
+              <div class="lna-set-group-title">自动匹配旧数据</div>
+              <div class="lna-switch-row lna-no-sep">
+                <span class="lna-switch-text">
+                  <span class="lna-switch-desc">模型在 LoRA 目录中被移动或改名后，其卡片资料（描述、触发词、标签译文等）会因路径变化而失联。点击按钮后，优先按 哈希值 匹配（哈希≈模型的身份证），无哈希时按 文件名+文件大小 匹配，把旧资料迁移到模型当前位置，并同步使用次数等统计；无法匹配的旧资料列入下方列表，便于手动清理。</span>
+                </span>
+                <button class="dlg-btn primary lna-match-run" type="button">扫描并迁移失联的卡片资料</button>
+              </div>
+              <div class="lna-match-progress lna-llm-progress" role="status" aria-live="polite" hidden></div>
+              <div class="lna-match-result" hidden>
+                <div class="lna-match-result-title">未能成功匹配<span class="lna-match-result-count"></span></div>
+                <div class="lna-match-result-desc">以下旧资料在 LoRA 目录中找不到对应的模型文件（可能已被删除或重命名），确认无用后可在 models_json_data 目录中手动清理。</div>
+                <ul class="lna-match-unmatched" aria-label="未能成功匹配的旧数据列表"></ul>
+              </div>
+              <div class="lna-switch-row lna-sep-top">
+                <span class="lna-switch-text">
+                  <span class="lna-switch-desc">读取 models/Lora 目录中旧插件 sd_forge_lora 生成的同名 JSON（与模型文件同目录、同名），把里面的描述、基础模型、触发词、推荐权重、反向提示词、注意事项同步到本插件的卡片资料。旧 JSON 不会被删除；新旧 JSON 都有内容时不会自动覆盖，而是列在下方由你决定是否覆盖。</span>
+                </span>
+                <button class="dlg-btn primary lna-sync-run" type="button">同步Lora的json到本插件</button>
+              </div>
+              <div class="lna-sync-progress lna-llm-progress" role="status" aria-live="polite" hidden></div>
+              <div class="lna-sync-conflicts" hidden>
+                <div class="lna-sync-conflicts-title">检测到冲突<span class="lna-sync-conflicts-count"></span></div>
+                <div class="lna-sync-conflicts-desc">这些模型的新旧 JSON 都已有内容，自动同步已跳过。点击「覆盖」会用旧 JSON 的资料覆盖本插件对应字段（训练标签与译文不受影响）。</div>
+                <ul class="lna-sync-list" aria-label="新旧 JSON 冲突列表"></ul>
+              </div>
             </div>`,
           footerHtml: `<button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>`,
           onOpen(modal) {
@@ -1234,6 +1266,8 @@
 
             updateRatioActive();
             bindLlmSettings(modal);
+            bindMatchOldData(modal);
+            bindSyncOldJson(modal);
           },
         });
       });
@@ -1951,6 +1985,435 @@
         setLlmProgress(modal, '启动下载失败：请求出错', true);
       }
     });
+  }
+
+  // ---------- 自动匹配旧数据 ----------
+  function setMatchProgress(modal, text, isErr) {
+    const box = modal.querySelector('.lna-match-progress');
+    if (!box) return;
+    box.hidden = !text;
+    box.textContent = text || '';
+    box.classList.toggle('is-err', !!isErr);
+  }
+
+  function renderMatchResult(modal, res) {
+    const wrap = modal.querySelector('.lna-match-result');
+    if (!wrap) return;
+    const list = (res && res.unmatched) || [];
+    const countEl = wrap.querySelector('.lna-match-result-count');
+    const ul = wrap.querySelector('.lna-match-unmatched');
+    if (countEl) countEl.textContent = list.length ? `（${list.length} 项）` : '（无）';
+    if (ul) {
+      ul.innerHTML = list.map((it) => {
+        const bits = [];
+        if (it.hash) bits.push('哈希 ' + esc(it.hash));
+        if (it.size) bits.push('大小 ' + fmtSize(it.size));
+        bits.push(it.has_content ? '含已填资料' : '空资料');
+        return `<li class="lna-match-item${it.has_content ? ' has-data' : ''}">
+            <span class="lna-match-item-path" title="${esc(it.rel)}">${esc(it.rel)}</span>
+            <span class="lna-match-item-meta">${esc(bits.join(' · '))}</span>
+          </li>`;
+      }).join('');
+    }
+    wrap.classList.toggle('is-empty', list.length === 0);
+    wrap.hidden = false;
+  }
+
+  function bindMatchOldData(modal) {
+    const btn = modal.querySelector('.lna-match-run');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.__lna_busy) return;
+      btn.__lna_busy = true;
+      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
+      const origText = btn.textContent;
+      btn.innerHTML = '<span class="lna-spinner"></span>正在匹配…';
+      setMatchProgress(modal, '正在扫描 LoRA 目录与旧资料…');
+      let res = null;
+      try {
+        const r = await fetch(API.matchOldData, { method: 'POST' });
+        res = await r.json();
+      } catch (e) {
+        res = null;
+      }
+      if (!document.contains(modal)) return;
+      btn.__lna_busy = false;
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      btn.textContent = origText;
+      if (!res || !res.ok) {
+        setMatchProgress(modal, (res && res.error) || '匹配失败：请求出错', true);
+        return;
+      }
+      const parts = [];
+      if (res.matched) parts.push(`成功匹配 ${res.matched} 项`);
+      if (res.moved) parts.push(`迁移 ${res.moved} 项`);
+      if (res.merged) parts.push(`合并 ${res.merged} 项`);
+      if (res.legacy_moved) parts.push(`补录旧版 ${res.legacy_moved} 项`);
+      const un = (res.unmatched || []).length;
+      if (!res.matched) {
+        setMatchProgress(modal, un ? `未发现可迁移的旧资料，${un} 项未能匹配` : '未发现需要迁移的旧资料', un > 0);
+      } else {
+        setMatchProgress(modal, `${parts.join('，')}；${un} 项未能匹配`, un > 0);
+      }
+      renderMatchResult(modal, res);
+      if (res.matched) {
+        // 迁移后模型卡片信息可能变化，重扫目录与列表
+        try {
+          await loadTree();
+          await loadDir(state.currentPath);
+          renderFull(getActiveRoot());
+        } catch (e) { /* 刷新失败不影响匹配结果展示 */ }
+        flashToast(`已迁移 ${res.matched} 项旧资料`);
+      }
+    });
+  }
+
+  // ---------- 同步旧插件（sd_forge_lora）的 JSON 到本插件 ----------
+  function setSyncProgress(modal, text, isErr) {
+    const box = modal.querySelector('.lna-sync-progress');
+    if (!box) return;
+    box.hidden = !text;
+    box.textContent = text || '';
+    box.classList.toggle('is-err', !!isErr);
+  }
+
+  // 渲染冲突列表：左为 JSON 名，右为【覆盖】按钮。列表随弹窗销毁，重新打开需再点同步重新检测
+  function renderSyncConflicts(modal, list) {
+    const wrap = modal.querySelector('.lna-sync-conflicts');
+    const ul = modal.querySelector('.lna-sync-list');
+    const countEl = modal.querySelector('.lna-sync-conflicts-count');
+    if (!wrap || !ul) return;
+    const items = list || [];
+    if (countEl) countEl.textContent = `（${items.length} 项）`;
+    ul.innerHTML = items.map((it) => {
+      // 差异字段标签：不同=黄橙、一边为空=红；一致的字段不显示
+      const tags = (it.fields || [])
+        .map((f) => `<span class="lna-sync-tag is-${esc(f.state)}">${esc(f.label)}</span>`)
+        .join('');
+      return `
+        <li class="lna-sync-item" data-rel="${esc(it.rel)}">
+          <div class="lna-sync-main">
+            <span class="lna-sync-name" title="${esc(it.rel)}">${esc(it.name)}</span>
+            ${tags ? `<div class="lna-sync-tags" aria-label="存在差异的字段">${tags}</div>` : ''}
+          </div>
+          <div class="lna-sync-actions">
+            <button class="dlg-btn lna-sync-compare" type="button" data-rel="${esc(it.rel)}" data-name="${esc(it.name)}">查看数据对比</button>
+            <button class="dlg-btn lna-sync-overwrite" type="button" data-rel="${esc(it.rel)}">覆盖</button>
+          </div>
+        </li>`;
+    }).join('');
+    wrap.hidden = items.length === 0;
+  }
+
+  // ---------- 数据对比弹窗（旧插件 JSON vs 本插件 JSON，左右两栏） ----------
+  function cmpLegendHtml() {
+    return `<div class="lna-cmp-legend">
+        <span class="is-same">一致</span>
+        <span class="is-diff">不同</span>
+        <span class="is-empty">一边为空</span>
+      </div>`;
+  }
+
+  function renderCompare(dlg, res) {
+    const body = dlg.querySelector('.dlg-body');
+    if (!body) return;
+    const rows = (res && res.rows) || [];
+    const cells = rows.map((r) => {
+      const ov = r.old ? esc(r.old) : '<em>（空）</em>';
+      const nv = r.new ? esc(r.new) : '<em>（空）</em>';
+      const same = r.state === 'same';
+      // 一致=灰色禁用；不同/一边为空=橙色可点
+      const btn = same
+        ? `<button class="dlg-btn lna-cmp-unify is-same" type="button" disabled title="两边数据已一致，无需统一">数据统一化</button>`
+        : `<button class="dlg-btn primary lna-cmp-unify" type="button" data-key="${esc(r.key)}" data-label="${esc(r.label)}" title="选择用哪一边的数据覆盖另一边">数据统一化</button>`;
+      return `<div class="lna-cmp-label">${esc(r.label)}</div>
+        <div class="lna-cmp-val is-${esc(r.state)}">${ov}</div>
+        <div class="lna-cmp-val is-${esc(r.state)}">${nv}</div>
+        ${btn}`;
+    }).join('');
+    body.innerHTML = `${cmpLegendHtml()}
+      <div class="lna-cmp">
+        <div class="lna-cmp-head">旧插件 JSON<span class="lna-cmp-sub">models/Lora/${esc(res.name)}.json</span></div>
+        <div class="lna-cmp-head">本插件 JSON<span class="lna-cmp-sub">models_json_data/${esc(res.name)}_new.json</span></div>
+        <div class="lna-cmp-head lna-cmp-head-op" aria-hidden="true"></div>
+        ${cells}
+      </div>`;
+  }
+
+  // 数据统一化：左右二选一，用所选一侧的值覆盖另一侧的文件
+  function openUnifyDialog(rel, row, onDone) {
+    if (document.querySelector('.lna-unify-mask')) return; // 已打开，忽略重复点击
+    const mask = document.createElement('div');
+    mask.className = 'lna-modal-mask lna-modal-mask--nested lna-unify-mask';
+    const dlg = document.createElement('div');
+    dlg.className = 'lna-dialog lna-unify-dlg';
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    dlg.setAttribute('aria-label', '数据统一化');
+    dlg.innerHTML = `
+      <header>
+        <span class="dlg-title">数据统一化<span class="lna-cf-hint">${esc(row.label)}</span></span>
+        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+      </header>
+      <div class="dlg-body">
+        <p class="lna-unify-tip">选择保留哪一边的值，点击后会用该值覆盖另一边的 JSON 文件。</p>
+        <div class="lna-unify-cols">
+          <div class="lna-unify-col">
+            <div class="lna-unify-head">旧插件 JSON</div>
+            <div class="lna-unify-val">${row.old ? esc(row.old) : '<em>（空）</em>'}</div>
+            <button class="dlg-btn primary lna-unify-pick" type="button" data-dir="old_to_new">用左侧覆盖右侧</button>
+          </div>
+          <div class="lna-unify-col">
+            <div class="lna-unify-head">本插件 JSON</div>
+            <div class="lna-unify-val">${row.new ? esc(row.new) : '<em>（空）</em>'}</div>
+            <button class="dlg-btn primary lna-unify-pick" type="button" data-dir="new_to_old">用右侧覆盖左侧</button>
+          </div>
+        </div>
+        <div class="lna-unify-msg" role="status" aria-live="polite" hidden></div>
+      </div>
+      <div class="dlg-footer">
+        <button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>
+      </div>`;
+    mask.appendChild(dlg);
+    document.body.appendChild(mask);
+    lockScroll();
+
+    let closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      mask.remove();
+      unlockScroll();
+    }
+    function setMsg(text, isErr) {
+      const box = dlg.querySelector('.lna-unify-msg');
+      if (!box) return;
+      box.hidden = !text;
+      box.textContent = text || '';
+      box.classList.toggle('is-err', !!isErr);
+    }
+    dlg.querySelector('.dlg-close').addEventListener('click', close);
+    dlg.querySelector('[data-act="close"]').addEventListener('click', close);
+    mask.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') trapFocus(e, dlg, close);
+    });
+
+    dlg.querySelectorAll('.lna-unify-pick').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (btn.__lna_busy) return;
+        btn.__lna_busy = true;
+        const picks = Array.from(dlg.querySelectorAll('.lna-unify-pick'));
+        picks.forEach((b) => { b.disabled = true; });
+        const origText = btn.textContent;
+        btn.innerHTML = '<span class="lna-spinner"></span>覆盖中…';
+        let res = null;
+        try {
+          const r = await fetch(API.syncOldJsonUnify, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rel, key: row.key, direction: btn.dataset.dir }),
+          });
+          res = await r.json();
+        } catch (e) {
+          res = null;
+        }
+        if (!document.contains(dlg)) return;
+        if (!res || !res.ok) {
+          btn.__lna_busy = false;
+          picks.forEach((b) => { b.disabled = false; });
+          btn.textContent = origText;
+          setMsg((res && res.error) || '覆盖失败：请求出错', true);
+          return;
+        }
+        flashToast(`已统一「${row.label}」`);
+        close();
+        if (onDone) onDone();
+      });
+    });
+  }
+
+  async function openCompareDialog(rel, name, parentModal) {
+    if (document.querySelector('.lna-cmp-mask')) return; // 已打开，忽略重复点击
+    const mask = document.createElement('div');
+    mask.className = 'lna-modal-mask lna-modal-mask--nested lna-cmp-mask';
+    const dlg = document.createElement('div');
+    dlg.className = 'lna-dialog lna-cmp-dlg';
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    dlg.setAttribute('aria-label', '数据对比');
+    dlg.innerHTML = `
+      <header>
+        <span class="dlg-title">数据对比<span class="lna-cf-hint">${esc(name)}</span></span>
+        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+      </header>
+      <div class="dlg-body">
+        <div class="dlg-loading" role="status" aria-live="polite"><span class="lna-spinner" aria-hidden="true"></span>正在读取数据…</div>
+      </div>
+      <div class="dlg-footer">
+        <button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>
+      </div>`;
+    mask.appendChild(dlg);
+    document.body.appendChild(mask);
+    lockScroll();
+
+    let closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      mask.remove();
+      unlockScroll();
+    }
+    dlg.querySelector('.dlg-close').addEventListener('click', close);
+    dlg.querySelector('[data-act="close"]').addEventListener('click', close);
+    mask.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') trapFocus(e, dlg, close);
+    });
+
+    const body = dlg.querySelector('.dlg-body');
+
+    // 拉取（或重新拉取）对比数据并渲染；统一化后调用可即时反映新状态
+    async function reload() {
+      let data = null;
+      try {
+        const r = await fetch(API.syncOldJsonCompare, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rel }),
+        });
+        data = await r.json();
+      } catch (e) {
+        data = null;
+      }
+      if (!document.contains(dlg)) return null; // 弹窗已被关闭，丢弃结果
+      if (!data || !data.ok) {
+        body.innerHTML = `<div class="dlg-empty">${esc((data && data.error) || '读取数据失败')}</div>`;
+        return null;
+      }
+      dlg.__lnaCompare = data;
+      renderCompare(dlg, data);
+      return data;
+    }
+
+    // 事件委托只绑一次：点击【数据统一化】弹出左右二选一小窗
+    body.addEventListener('click', (e) => {
+      const ub = e.target.closest('.lna-cmp-unify');
+      if (!ub || ub.disabled) return;
+      const data = dlg.__lnaCompare;
+      const row = data && (data.rows || []).find((r) => r.key === ub.dataset.key);
+      if (!row) return;
+      openUnifyDialog(rel, row, async () => {
+        await reload();
+        // 该字段统一后可能不再是冲突，同步刷新父弹窗的冲突列表
+        if (parentModal && document.contains(parentModal)) {
+          try {
+            const r = await fetch(API.syncOldJson, { method: 'POST' });
+            const s = await r.json();
+            if (s && s.ok) renderSyncConflicts(parentModal, s.conflicts || []);
+          } catch (err) { /* 刷新失败不影响统一结果 */ }
+        }
+      });
+    });
+
+    await reload();
+  }
+
+  function bindSyncOldJson(modal) {
+    const btn = modal.querySelector('.lna-sync-run');
+    if (!btn) return;
+    const ul = modal.querySelector('.lna-sync-list');
+    const wrap = modal.querySelector('.lna-sync-conflicts');
+
+    btn.addEventListener('click', async () => {
+      if (btn.__lna_busy) return;
+      btn.__lna_busy = true;
+      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
+      const origText = btn.textContent;
+      btn.innerHTML = '<span class="lna-spinner"></span>正在同步…';
+      setSyncProgress(modal, '正在扫描旧插件 JSON…');
+      let res = null;
+      try {
+        const r = await fetch(API.syncOldJson, { method: 'POST' });
+        res = await r.json();
+      } catch (e) {
+        res = null;
+      }
+      if (!document.contains(modal)) return;
+      btn.__lna_busy = false;
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+      btn.textContent = origText;
+      if (!res || !res.ok) {
+        setSyncProgress(modal, (res && res.error) || '同步失败：请求出错', true);
+        return;
+      }
+      const conflicts = res.conflicts || [];
+      const parts = [];
+      if (res.created) parts.push(`新建 ${res.created} 项`);
+      if (res.filled) parts.push(`补齐 ${res.filled} 项`);
+      const summary = parts.length
+        ? `已同步：${parts.join('，')}`
+        : '没有可同步的旧资料（旧 JSON 无内容或已同步）';
+      setSyncProgress(modal, conflicts.length ? `${summary}；${conflicts.length} 项冲突待处理` : summary, conflicts.length > 0);
+      renderSyncConflicts(modal, conflicts);
+      if (res.created || res.filled) {
+        try {
+          await loadTree();
+          await loadDir(state.currentPath);
+          renderFull(getActiveRoot());
+        } catch (e) { /* 刷新失败不影响同步结果展示 */ }
+        flashToast(`已同步 ${(res.created || 0) + (res.filled || 0)} 项旧资料`);
+      }
+    });
+
+    // 冲突列表：事件委托绑定一次；【查看数据对比】开对比弹窗，【覆盖】成功后移除该项
+    if (ul) {
+      ul.addEventListener('click', async (e) => {
+        const cmp = e.target.closest('.lna-sync-compare');
+        if (cmp) {
+          openCompareDialog(cmp.dataset.rel, cmp.dataset.name || '', modal);
+          return;
+        }
+        const ob = e.target.closest('.lna-sync-overwrite');
+        if (!ob || ob.__lna_busy) return;
+        const rel = ob.dataset.rel;
+        ob.__lna_busy = true;
+        ob.disabled = true;
+        try {
+          const r = await fetch(API.syncOldJsonOverwrite, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rel }),
+          });
+          const res = await r.json();
+          if (!res || !res.ok) {
+            ob.__lna_busy = false;
+            ob.disabled = false;
+            flashToast('覆盖失败：' + ((res && res.error) || '未知错误'), true);
+            return;
+          }
+        } catch (err) {
+          ob.__lna_busy = false;
+          ob.disabled = false;
+          flashToast('覆盖失败：请求出错', true);
+          return;
+        }
+        if (!document.contains(modal)) return;
+        const li = ob.closest('.lna-sync-item');
+        if (li) li.remove();
+        const left = ul.querySelectorAll('.lna-sync-item').length;
+        const countEl = modal.querySelector('.lna-sync-conflicts-count');
+        if (countEl) countEl.textContent = `（${left} 项）`;
+        if (wrap && left === 0) wrap.hidden = true;
+        flashToast('已用旧 JSON 覆盖');
+        try {
+          await loadDir(state.currentPath);
+          renderFull(getActiveRoot());
+        } catch (e) { /* 刷新失败不影响覆盖结果 */ }
+      });
+    }
   }
 
   // ---------- 排序胶囊 ----------
@@ -3533,8 +3996,8 @@
   }
 
   function closeModal(el) {
-    // 主弹窗关闭时连带关闭嵌套小弹窗（重翻/词典），避免残留蒙版
-    document.querySelectorAll('.lna-repick-mask, .lna-dict-mask').forEach((m) => {
+    // 主弹窗关闭时连带关闭嵌套小弹窗（重翻/词典/数据对比/数据统一化），避免残留蒙版
+    document.querySelectorAll('.lna-repick-mask, .lna-dict-mask, .lna-cmp-mask, .lna-unify-mask').forEach((m) => {
       m.remove();
       unlockScroll();
     });

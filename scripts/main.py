@@ -1736,6 +1736,656 @@ def _store_card_translations(rel: str, lang: str, mapping: dict) -> None:
         _save_card_json(rel, data)
 
 
+# ---------- 自动匹配旧数据（模型移动/改名后找回卡片资料） ----------
+# 场景：models/Lora 下的模型被移动或改名，但 models_json_data 里的镜像 JSON
+# 仍留在旧相对路径，data/stats.json 里按旧路径记录的 usage_count / last_viewed /
+# custom_previews 也一起失联 → 卡片信息"丢失"。
+# 匹配优先级：① 哈希值（几乎等同于模型的身份证）；② 无哈希时 文件名 + 文件大小
+# （同名且等大小≈同一模型）。两级都要求「唯一命中」才迁移，避免歧义误迁。
+# 匹配成功：把 JSON 移到新路径（新路径已有 JSON 时保留新数据、删除旧文件），
+# 并把 stats 三类记录同步改名；匹配失败的孤立 JSON 返回给前端展示，便于人工清理。
+
+def _iter_model_files() -> list[dict]:
+    """递归扫描 LoRA 库，返回 [{rel, size, hash}]。
+
+    哈希优先读 JSON 里已存的锚点（零成本）；缺失时从 safetensors 元数据或
+    WebUI 文件哈希缓存补齐（与 card_info 的补齐逻辑一致，不直接计算全文件哈希）。
+    """
+    out: list[dict] = []
+    if not LORA_DIR.exists():
+        return out
+    for root, _dirs, files in os.walk(LORA_DIR):
+        for fn in files:
+            if Path(fn).suffix.lower() not in LORA_EXTS:
+                continue
+            p = Path(root) / fn
+            try:
+                rel = _rel(p)
+                size = p.stat().st_size
+            except Exception:
+                continue
+            h = ""
+            cached = _load_card_json(rel)
+            if isinstance(cached, dict):
+                h = str(cached.get("hash") or "")
+            if not h and p.suffix.lower() == ".safetensors":
+                try:
+                    from modules import cache, sd_models
+
+                    meta = cache.cached_data_for_file(
+                        "safetensors-metadata", "lora_new/" + rel, str(p),
+                        lambda: sd_models.read_metadata_from_safetensors(str(p)),
+                    ) or {}
+                    h = _short_hash(p, rel, meta)
+                except Exception:
+                    h = ""
+            out.append({"rel": rel, "size": size, "hash": h})
+    return out
+
+
+def _iter_orphan_jsons() -> list[dict]:
+    """遍历 models_json_data 下所有镜像 JSON，返回模型文件已不存在的 [{rel, data}]。
+
+    rel 为 JSON 相对 models_json_data 的路径去掉 _new.json 后缀还原出的旧模型相对路径。
+    """
+    orphans: list[dict] = []
+    if not JSON_DATA_DIR.exists():
+        return orphans
+    suffix = "_new.json"
+    for root, _dirs, files in os.walk(JSON_DATA_DIR):
+        for fn in files:
+            if not fn.endswith(suffix):
+                continue
+            jp = Path(root) / fn
+            try:
+                rel = str(jp.relative_to(JSON_DATA_DIR)).replace("\\", "/")
+            except Exception:
+                continue
+            rel = rel[: -len(suffix)] if rel.endswith(suffix) else rel
+            if not rel:
+                continue
+            target = LORA_DIR / rel
+            if target.is_file() or target.is_dir():
+                continue  # 模型/文件夹还在原位，不属于旧数据（文件夹说明 JSON 同规则）
+            try:
+                data = json.loads(jp.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                orphans.append({"rel": rel, "data": data})
+    return orphans
+
+
+def _migrate_stats_keys(old_rel: str, new_rel: str) -> None:
+    """把 usage_count / last_viewed / custom_previews 里的旧路径记录改到新路径。"""
+    changed = False
+    for bucket in ("usage_count", "last_viewed", "custom_previews"):
+        if old_rel in _stats[bucket]:
+            val = _stats[bucket].pop(old_rel)
+            if new_rel not in _stats[bucket]:  # 新路径已有记录时保留新值
+                _stats[bucket][new_rel] = val
+            changed = True
+    if changed:
+        _save_stats()
+
+
+def match_old_data() -> dict:
+    """执行一次自动匹配，返回 {ok, matched, moved, merged, unmatched}。
+
+    matched: 匹配成功条数；moved: 实际移动的 JSON 数；merged: 新路径已有 JSON、
+    旧文件被清理合并的条数；unmatched: 未能匹配到任何现存模型的孤立 JSON 列表。
+    """
+    models = _iter_model_files()
+    orphans = _iter_orphan_jsons()
+    existing_rels = {m["rel"] for m in models}
+
+    by_hash: dict[str, list[dict]] = {}
+    by_name_size: dict[tuple[str, int], list[dict]] = {}
+    for m in models:
+        if m["hash"]:
+            by_hash.setdefault(m["hash"].lower()[:10], []).append(m)
+        stem = Path(m["rel"]).stem.lower()
+        by_name_size.setdefault((stem, m["size"]), []).append(m)
+
+    # 旧 JSON 之间先按特异性排序：有哈希的优先认领，其次 文件名+大小 齐全者
+    def _specificity(o: dict) -> tuple:
+        d = o["data"]
+        return (
+            0 if str(d.get("hash") or "") else 1,
+            0 if d.get("size") else 1,
+        )
+
+    orphans.sort(key=_specificity)
+    claimed: set[str] = set()  # 已被旧 JSON 认领的模型 rel
+    matched = 0
+    moved = 0
+    merged = 0
+    unmatched: list[dict] = []
+
+    for o in orphans:
+        d = o["data"]
+        old_rel = o["rel"]
+        old_hash = str(d.get("hash") or "").lower()[:10]
+        old_size = d.get("size") or 0
+        # 旧文件名：优先 JSON 内记录，缺失时从旧相对路径的文件名还原（去掉 _new.json）
+        old_name = str(d.get("filename") or d.get("name") or Path(old_rel).name)
+        if old_name.endswith("_new.json"):
+            old_name = old_name[: -len("_new.json")]
+        old_stem = Path(old_name).stem.lower()
+
+        # 匹配规则：① 哈希值（模型的身份证，唯一命中才认）；
+        # ② 无哈希或哈希未命中时，文件名 + 文件大小 同时相等（同名同大小≈同一模型）。
+        target: dict | None = None
+        if old_hash:
+            cands = [m for m in by_hash.get(old_hash, []) if m["rel"] not in claimed]
+            if len(cands) == 1:
+                target = cands[0]
+        if target is None and old_stem and old_size:
+            try:
+                cands = [m for m in by_name_size.get((old_stem, int(old_size)), []) if m["rel"] not in claimed]
+            except Exception:
+                cands = []
+            if len(cands) == 1:
+                target = cands[0]
+        if target is None:
+            unmatched.append({
+                "rel": old_rel,
+                "hash": old_hash,
+                "size": old_size,
+                "has_content": _card_data_has_content(d),
+            })
+            continue
+
+        claimed.add(target["rel"])
+        new_rel = target["rel"]
+        with _json_lock:
+            new_data = _load_card_json(new_rel)
+            if new_data is None:
+                # 新路径还没有 JSON：把旧文件整体搬过去，顺带补齐锚点
+                if not d.get("hash") and target["hash"]:
+                    d["hash"] = target["hash"]
+                d["size"] = target["size"]
+                ok = _save_card_json(new_rel, d)
+                if ok:
+                    _delete_card_json(old_rel)
+                    moved += 1
+            else:
+                # 新路径已有 JSON（模型移动后打开过卡片、自动生成了空资料）：
+                # 把旧 JSON 里填过的内容字段补进新数据（新值优先），再清理旧文件
+                for k in CARD_JSON_KEYS:
+                    if k in ("hash", "size"):
+                        continue
+                    if k not in new_data or new_data[k] in ("", [], {}, 0, 0.0, None):
+                        if k in d and d[k] not in ("", [], {}, 0, 0.0, None):
+                            new_data[k] = d[k]
+                # 译文对照合并：旧 JSON 的译文不覆盖新 JSON 已有的键
+                old_tr = d.get("translations")
+                if isinstance(old_tr, dict) and old_tr:
+                    new_tr = new_data.get("translations")
+                    if not isinstance(new_tr, dict):
+                        new_tr = {}
+                    for lang, bucket in old_tr.items():
+                        if not isinstance(bucket, dict):
+                            continue
+                        mb = new_tr.get(lang)
+                        if not isinstance(mb, dict):
+                            mb = {}
+                        for tag, zh in bucket.items():
+                            mb.setdefault(tag, zh)
+                        new_tr[lang] = mb
+                    new_data["translations"] = new_tr
+                ok = _save_card_json(new_rel, new_data)
+                if ok:
+                    _delete_card_json(old_rel)
+                    merged += 1
+        if ok:
+            _migrate_stats_keys(old_rel, new_rel)
+            matched += 1
+        else:
+            unmatched.append({
+                "rel": old_rel,
+                "hash": old_hash,
+                "size": old_size,
+                "has_content": _card_data_has_content(d),
+            })
+
+    # 顺带迁移 stats.user_metadata 里仍按旧路径存着的遗留条目（同样按 哈希 → 文件名+大小 认领）
+    legacy_moved = 0
+    legacy_unmatched: list[dict] = []
+    with _json_lock:
+        for old_rel, legacy in list(_stats["user_metadata"].items()):
+            if old_rel in existing_rels or not isinstance(legacy, dict):
+                continue
+            l_hash = str(legacy.get("hash") or "").lower()[:10]
+            l_size = legacy.get("size") or 0
+            l_stem = Path(old_rel).stem.lower()
+            target = None
+            if l_hash:
+                cands = [m for m in by_hash.get(l_hash, []) if m["rel"] not in claimed]
+                if len(cands) == 1:
+                    target = cands[0]
+            if target is None and l_stem and l_size:
+                try:
+                    cands = [m for m in by_name_size.get((l_stem, int(l_size)), []) if m["rel"] not in claimed]
+                except Exception:
+                    cands = []
+                if len(cands) == 1:
+                    target = cands[0]
+            if target is not None:
+                new_rel = target["rel"]
+                base = _empty_card_data()
+                base.update({k: legacy[k] for k in CARD_JSON_KEYS if k in legacy})
+                if not base.get("hash") and target["hash"]:
+                    base["hash"] = target["hash"]
+                base["size"] = target["size"]
+                if _save_card_json(new_rel, base):
+                    claimed.add(new_rel)
+                    _stats["user_metadata"].pop(old_rel, None)
+                    _migrate_stats_keys(old_rel, new_rel)
+                    legacy_moved += 1
+                    matched += 1
+            else:
+                legacy_unmatched.append({
+                    "rel": old_rel,
+                    "hash": l_hash,
+                    "size": l_size,
+                    "has_content": _card_data_has_content(legacy),
+                })
+    if legacy_moved:
+        _save_stats()
+    unmatched.extend(legacy_unmatched)
+
+    return {
+        "ok": True,
+        "matched": matched,
+        "moved": moved,
+        "merged": merged,
+        "legacy_moved": legacy_moved,
+        "model_count": len(models),
+        "orphan_count": len(orphans) + len(_stats["user_metadata"]),
+        "unmatched": sorted(unmatched, key=lambda x: x["rel"]),
+    }
+
+
+def _card_data_has_content(d: dict) -> bool:
+    """判断旧 JSON 是否含实际填写过的资料（描述/触发词/标签/译文等），供前端区分展示。"""
+    for k in ("description", "activation_text", "negative_text", "notes", "base_model"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip() and v.strip() != "Unknown":
+            return True
+    if d.get("tags"):
+        return True
+    tr = d.get("translations")
+    if isinstance(tr, dict) and any(isinstance(b, dict) and b for b in tr.values()):
+        return True
+    try:
+        if float(d.get("preferred_weight") or 0) != 0.0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _delete_card_json(rel: str) -> bool:
+    """删除 models_json_data 下的镜像 JSON（迁移完成后清理旧位置文件）。"""
+    path = _card_json_path(rel)
+    if path is None:
+        return False
+    try:
+        if path.is_file():
+            path.unlink()
+        _card_desc_cache.pop(_safe_rel(rel), None)
+        return True
+    except Exception:
+        return False
+
+
+# ---------- 同步旧插件（sd_forge_lora）的 JSON 到本插件 ----------
+# 旧插件把用户填写的资料写在模型同目录、同名（仅扩展名换成 .json）的文件里，
+# 键名带空格且与本插件不同，需做一次字段映射。旧 JSON 只保留用户可编辑的
+# 6 个字段；本插件镜像 JSON 里的 hash/size 锚点、训练标签、译文对照属于
+# 本插件自动生成的内容，同步时不动它们。
+SD_VERSIONS = ("SD1", "SD2", "SDXL", "Flux", "Unknown")
+
+# 旧 JSON 键 → 本插件 JSON 键
+OLD_JSON_KEYMAP = {
+    "description": "description",
+    "sd version": "base_model",
+    "activation text": "activation_text",
+    "preferred weight": "preferred_weight",
+    "negative text": "negative_text",
+    "notes": "notes",
+}
+# 反向映射：本插件 JSON 键 → 旧 JSON 键（数据统一化写回旧插件时用）
+OLD_JSON_KEYMAP_REV = {v: k for k, v in OLD_JSON_KEYMAP.items()}
+# 卡片资料里「由用户填写」的字段（tags/translations 为插件自动生成，不算冲突依据）
+CARD_USER_KEYS = (
+    "description", "base_model", "activation_text",
+    "preferred_weight", "negative_text", "notes",
+)
+
+
+def _old_json_path(rel: str) -> Path | None:
+    """模型相对路径 → 旧插件 JSON 路径（同目录、同名、扩展名换成 .json）。"""
+    safe = _safe_rel(rel)
+    if not safe:
+        return None
+    return (LORA_DIR / safe).with_suffix(".json")
+
+
+def _old_json_to_card(old: dict) -> dict:
+    """旧插件 JSON → 本插件卡片 JSON（只取用户可编辑字段，其余留默认值）。"""
+    card = _empty_card_data()
+    for src, dst in OLD_JSON_KEYMAP.items():
+        if src not in old:
+            continue
+        val = old[src]
+        if dst == "preferred_weight":
+            try:
+                card[dst] = float(val or 0)
+            except Exception:
+                card[dst] = 0.0
+        elif dst == "base_model":
+            v = str(val or "")
+            card[dst] = v if v in SD_VERSIONS else "Unknown"
+        else:
+            card[dst] = str(val or "")
+    return card
+
+
+def _card_user_content(d: dict) -> bool:
+    """是否含用户填写的资料（只看 6 个可编辑字段，不含自动生成的标签/译文）。"""
+    for k in ("description", "activation_text", "negative_text", "notes"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return True
+    if str(d.get("base_model") or "") not in ("", "Unknown"):
+        return True
+    try:
+        if float(d.get("preferred_weight") or 0) != 0.0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _iter_old_json_items() -> list[dict]:
+    """遍历 LoRA 库中「同时存在旧插件同名 JSON」的模型，返回 [{rel, data}]。"""
+    out: list[dict] = []
+    if not LORA_DIR.exists():
+        return out
+    for root, _dirs, files in os.walk(LORA_DIR):
+        for fn in files:
+            if Path(fn).suffix.lower() not in LORA_EXTS:
+                continue
+            jp = (Path(root) / fn).with_suffix(".json")
+            if not jp.is_file():
+                continue
+            try:
+                data = json.loads(jp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            out.append({"rel": _rel(Path(root) / fn), "data": data})
+    out.sort(key=lambda x: x["rel"])
+    return out
+
+
+def _merge_old_into_card(new_data: dict, old_card: dict) -> None:
+    """把旧 JSON 的用户字段写进新 JSON（就地修改，保留新 JSON 的其余字段）。"""
+    for k in CARD_USER_KEYS:
+        if k in old_card:
+            new_data[k] = old_card[k]
+
+
+# 数据对比的字段与中文名（与卡片设置弹窗、旧插件 JSON 字段一一对应）
+COMPARE_FIELDS = (
+    ("description", "描述"),
+    ("base_model", "基础模型"),
+    ("activation_text", "触发词"),
+    ("preferred_weight", "推荐权重"),
+    ("negative_text", "反向提示词"),
+    ("notes", "注意事项"),
+)
+
+
+def _cmp_display(key: str, val) -> str:
+    """对比用展示值：未设置的统一为空串（权重 0、基础模型 Unknown 视为未设置）。"""
+    if key == "preferred_weight":
+        try:
+            w = float(val or 0)
+        except Exception:
+            w = 0.0
+        return "" if w == 0 else f"{w:g}"
+    s = str(val or "").strip()
+    if key == "base_model" and s == "Unknown":
+        return ""
+    return s
+
+
+def _compare_rows(old_card: dict, new_data: dict) -> list[dict]:
+    """逐字段对比，state：same=一致 / diff=都有值但不同 / empty=一边有值一边为空。"""
+    rows = []
+    for key, label in COMPARE_FIELDS:
+        o = _cmp_display(key, old_card.get(key))
+        n = _cmp_display(key, new_data.get(key))
+        if o == n:
+            state = "same"
+        elif not o or not n:
+            state = "empty"
+        else:
+            state = "diff"
+        rows.append({"key": key, "label": label, "old": o, "new": n, "state": state})
+    return rows
+
+
+def sync_old_json() -> dict:
+    """把旧插件（models/Lora 下同名 .json）的资料同步到本插件的镜像 JSON。
+
+    规则：
+      - 旧 JSON 无用户内容 → 跳过（没有可同步的数据）
+      - 新 JSON 不存在      → 新建并写入旧资料
+      - 新 JSON 存在但无内容 → 用旧资料补齐
+      - 新旧内容已一致       → 跳过（此前同步过）
+      - 新旧都有内容且不同   → 记为冲突，返回前端由用户点【覆盖】决定，不自动改
+    每次调用都实时重扫磁盘，不使用缓存结果；旧 JSON 一律不删除。
+    """
+    created = 0
+    filled = 0
+    scanned = 0
+    conflicts: list[dict] = []
+    for item in _iter_old_json_items():
+        rel = item["rel"]
+        old_card = _old_json_to_card(item["data"])
+        if not _card_user_content(old_card):
+            continue
+        scanned += 1
+        with _json_lock:
+            new_data = _load_card_json(rel)
+            if new_data is None:
+                try:
+                    old_card["size"] = (LORA_DIR / rel).stat().st_size
+                except Exception:
+                    pass
+                if _save_card_json(rel, old_card):
+                    created += 1
+                continue
+            if not _card_user_content(new_data):
+                _merge_old_into_card(new_data, old_card)
+                if not new_data.get("size"):
+                    try:
+                        new_data["size"] = (LORA_DIR / rel).stat().st_size
+                    except Exception:
+                        pass
+                if _save_card_json(rel, new_data):
+                    filled += 1
+                continue
+            # 冲突判定与对比弹窗用同一套归一化结果，保证「冲突项一定有差异字段」
+            changed = [
+                {"label": r["label"], "state": r["state"]}
+                for r in _compare_rows(old_card, new_data) if r["state"] != "same"
+            ]
+            if changed:
+                conflicts.append({"rel": rel, "name": Path(rel).stem, "fields": changed})
+    return {
+        "ok": True,
+        "scanned": scanned,
+        "created": created,
+        "filled": filled,
+        "conflicts": sorted(conflicts, key=lambda x: x["rel"]),
+    }
+
+
+def overwrite_from_old_json(rel: str) -> dict:
+    """冲突处理：用旧插件 JSON 的用户字段覆盖本插件镜像 JSON 的对应字段。"""
+    safe = _safe_rel(rel)
+    if not safe:
+        return {"ok": False, "error": "无效的文件路径"}
+    jp = _old_json_path(safe)
+    if jp is None or not jp.is_file():
+        return {"ok": False, "error": "未找到对应的旧 JSON"}
+    try:
+        old = json.loads(jp.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"读取旧 JSON 失败：{e}"}
+    if not isinstance(old, dict):
+        return {"ok": False, "error": "旧 JSON 格式不正确"}
+    old_card = _old_json_to_card(old)
+    with _json_lock:
+        new_data = _load_card_json(safe)
+        if new_data is None:
+            new_data = old_card
+        else:
+            _merge_old_into_card(new_data, old_card)
+        if not new_data.get("size"):
+            try:
+                new_data["size"] = (LORA_DIR / safe).stat().st_size
+            except Exception:
+                pass
+        if not _save_card_json(safe, new_data):
+            return {"ok": False, "error": "写入 JSON 失败"}
+    return {"ok": True}
+
+
+def unify_old_json_field(rel: str, key: str, direction: str) -> dict:
+    """数据统一化：用一侧的字段值覆盖另一侧的文件。
+
+    direction = old_to_new：旧插件值 → 本插件 JSON
+              = new_to_old：本插件值 → 旧插件 JSON（会写入 models/Lora 下的旧 JSON）
+    """
+    safe = _safe_rel(rel)
+    if not safe:
+        return {"ok": False, "error": "无效的文件路径"}
+    if key not in CARD_USER_KEYS:
+        return {"ok": False, "error": "不支持的字段"}
+    jp = _old_json_path(safe)
+    if jp is None or not jp.is_file():
+        return {"ok": False, "error": "未找到对应的旧 JSON"}
+
+    if direction == "old_to_new":
+        try:
+            old = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"ok": False, "error": f"读取旧 JSON 失败：{e}"}
+        if not isinstance(old, dict):
+            return {"ok": False, "error": "旧 JSON 格式不正确"}
+        val = _old_json_to_card(old).get(key)
+        with _json_lock:
+            new_data = _load_card_json(safe)
+            if not isinstance(new_data, dict):
+                new_data = _empty_card_data()
+            new_data[key] = val
+            if not new_data.get("size"):
+                try:
+                    new_data["size"] = (LORA_DIR / safe).stat().st_size
+                except Exception:
+                    pass
+            if not _save_card_json(safe, new_data):
+                return {"ok": False, "error": "写入本插件 JSON 失败"}
+        return {"ok": True, "key": key, "direction": direction}
+
+    if direction == "new_to_old":
+        new_data = _load_card_json(safe)
+        if not isinstance(new_data, dict):
+            new_data = _empty_card_data()
+        val = new_data.get(key, _empty_card_data().get(key))
+        if key == "preferred_weight":
+            try:
+                out = float(val or 0)
+            except Exception:
+                out = 0.0
+        else:
+            out = str(val or "")
+        try:
+            old = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        if not isinstance(old, dict):
+            old = {}
+        old[OLD_JSON_KEYMAP_REV[key]] = out
+        # 与旧插件写入保持一致：indent=4、ensure_ascii=False；原子写避免写坏旧文件
+        try:
+            tmp = jp.with_suffix(jp.suffix + ".tmp")
+            tmp.write_text(json.dumps(old, ensure_ascii=False, indent=4), encoding="utf-8")
+            tmp.replace(jp)
+        except Exception as e:
+            return {"ok": False, "error": f"写入旧 JSON 失败：{e}"}
+        return {"ok": True, "key": key, "direction": direction}
+
+    return {"ok": False, "error": "不支持的统一方向"}
+
+
+# 数据对比弹窗的字段与中文名（与卡片设置弹窗、旧插件 JSON 字段一一对应）
+COMPARE_FIELDS = (
+    ("description", "描述"),
+    ("base_model", "基础模型"),
+    ("activation_text", "触发词"),
+    ("preferred_weight", "推荐权重"),
+    ("negative_text", "反向提示词"),
+    ("notes", "注意事项"),
+)
+
+
+def _cmp_display(key: str, val) -> str:
+    """对比用展示值：未设置的统一为空串（权重 0、基础模型 Unknown 视为未设置）。"""
+    if key == "preferred_weight":
+        try:
+            w = float(val or 0)
+        except Exception:
+            w = 0.0
+        return "" if w == 0 else f"{w:g}"
+    s = str(val or "").strip()
+    if key == "base_model" and s == "Unknown":
+        return ""
+    return s
+
+
+def compare_old_json(rel: str) -> dict:
+    """冲突项字段级对比：左为旧插件 JSON，右为本插件镜像 JSON。
+
+    每行附带 state：same=一致 / diff=都有值但不同 / empty=一边有值一边为空。
+    """
+    safe = _safe_rel(rel)
+    if not safe:
+        return {"ok": False, "error": "无效的文件路径"}
+    jp = _old_json_path(safe)
+    if jp is None or not jp.is_file():
+        return {"ok": False, "error": "未找到对应的旧 JSON"}
+    try:
+        old = json.loads(jp.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"读取旧 JSON 失败：{e}"}
+    if not isinstance(old, dict):
+        return {"ok": False, "error": "旧 JSON 格式不正确"}
+    old_card = _old_json_to_card(old)
+    new_data = _load_card_json(safe)
+    if not isinstance(new_data, dict):
+        new_data = _empty_card_data()
+    return {"ok": True, "rel": safe, "name": Path(safe).stem,
+            "rows": _compare_rows(old_card, new_data)}
+
+
 # ---------- FastAPI 路由 ----------
 def _ensure_lora_engine() -> None:
     """sd_forge_lora 未启用时，由本插件自带的引擎接管 `<lora:...>`。
@@ -2074,6 +2724,43 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             "finished": st["ok"],           # 命名避开与请求状态 ok 冲突
             "cuda_wheel_ready": _cuda_wheel_downloaded(),
         }
+
+    @app.post("/lora_new/api/match_old_data")
+    def api_match_old_data():
+        try:
+            return match_old_data()
+        except Exception as e:
+            return {"ok": False, "error": f"匹配失败：{e}"}
+
+    @app.post("/lora_new/api/sync_old_json")
+    def api_sync_old_json():
+        try:
+            return sync_old_json()
+        except Exception as e:
+            return {"ok": False, "error": f"同步失败：{e}"}
+
+    @app.post("/lora_new/api/sync_old_json_overwrite")
+    async def api_sync_old_json_overwrite(payload: dict):
+        try:
+            return overwrite_from_old_json(payload.get("rel", ""))
+        except Exception as e:
+            return {"ok": False, "error": f"覆盖失败：{e}"}
+
+    @app.post("/lora_new/api/sync_old_json_compare")
+    async def api_sync_old_json_compare(payload: dict):
+        try:
+            return compare_old_json(payload.get("rel", ""))
+        except Exception as e:
+            return {"ok": False, "error": f"对比失败：{e}"}
+
+    @app.post("/lora_new/api/sync_old_json_unify")
+    async def api_sync_old_json_unify(payload: dict):
+        try:
+            return unify_old_json_field(
+                payload.get("rel", ""), payload.get("key", ""), payload.get("direction", "")
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"统一失败：{e}"}
 
     @app.post("/lora_new/api/user_metadata")
     async def api_user_metadata(payload: dict):
