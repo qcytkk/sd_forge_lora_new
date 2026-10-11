@@ -2,6 +2,24 @@
 
 Stable Diffusion WebUI Forge 的 **LoRA 管理器** 插件。以「LoRA 管理器」页面形式注入到 txt2img / img2img 下方的 Extra Networks 区域，提供 **顶部栏 + 左侧文件夹树 + 右侧卡片网格** 的三栏文件管理器式浏览，替代内置 `sd_forge_lora` 的平铺卡片页。
 
+## 界面预览
+
+**LoRA 管理器主界面**：顶部栏（搜索 / 排序 / 刷新 / 插件设置 / 翻译模型状态 / 模型统计）、左侧文件夹树与右侧卡片网格。鼠标悬停卡片即出现「使用 Lora 提示词」按钮，避免误触写入。
+
+![LoRA 管理器主界面](docs/images/01-main-ui.png)
+
+**卡片设置**：展示 safetensors 内部元数据（哈希值、模型类型、训练日期、分辨率等）与数据集训练标签（角标数字为出现次数）。可编辑描述、基础模型、触发词、推荐权重、反向提示词与注意事项，并集中提供标签翻译的各类入口。
+
+![卡片设置](docs/images/02-card-settings.png)
+
+**将译文加入词典**：单选一个标签即可查询它在翻译词典中的收录情况，确认后把该标签的当前译文写入或替换词典。
+
+![将译文加入词典](docs/images/03-add-to-dictionary.png)
+
+**人工修正译文**：单选标签后手工填写或修正其中文译文，保存后立即生效。
+
+![人工修正译文](docs/images/04-manual-fix-translation.png)
+
 ## 功能特性
 
 - **三栏式浏览**：顶部栏 + 左侧文件夹树 + 右侧 LoRA 卡片网格
@@ -11,6 +29,7 @@ Stable Diffusion WebUI Forge 的 **LoRA 管理器** 插件。以「LoRA 管理�
 - **悬停确认式写入提示词**：`<lora:名字:权重> 触发词`，防误触
 - **卡片设置详情页**：safetensors 元数据、训练标签、触发词 / 反向提示词 / 推荐权重、封面上传
 - **标签中文翻译**：本地词典 + GGUF 大模型混合翻译，支持翻译模型自动下载
+- **界面多语言（i18n）**：内置简体中文 / 繁體中文 / English / 日本語 / 한국어 / Français / Русский 七种语言；语言包放在 `lna_i18n/locales/`，新增语言只需放入一个同结构 JSON，无需改动代码
 - **可独立运行**：自带 `lna_lora_engine`，内置 `sd_forge_lora` 被禁用时自动接管 `<lora:>` 解析
 
 ## 安装
@@ -85,6 +104,8 @@ sd_forge_lora_new/
 ├── javascript/lora_new.js    # 前端交互
 ├── style.css                 # 样式
 ├── lna_lora_engine/          # 自带的 <lora:> 解析引擎
+├── lna_i18n/                 # 界面多语言（locales/ 语言包 + 后端实现）
+├── docs/images/              # README 截图
 ├── data/                     # 运行时数据（group_tags.zh_CN.csv 为静态词典）
 └── .gitignore
 ```
