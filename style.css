@@ -2159,3 +2159,68 @@ body.dark .lna-dialog .lna-cf-weight-num { border-color: #374151; background: #1
 .lna-root .lna-card .lna-use-btn * { color: var(--lna-brand-contrast-text) !important; }
 .lna-root .lna-card .lna-use-btn:hover,
 .lna-root .lna-card .lna-use-btn:hover * { color: #fff !important; }
+
+/* ---------- 大图预览（点击卡片设置弹窗右侧预览图打开）---------- */
+/* 有预览图时鼠标提示可点开大图（无图时 .is-empty，点击不生效） */
+.lna-dialog .lna-cf-preview:not(.is-empty) { cursor: zoom-in; }
+
+.lna-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9700;                /* 高于详情弹窗（9500/9600），低于 Toast（9999） */
+  background: rgba(0, 0, 0, .9);
+  overflow: hidden;
+  font-family: "Source Sans Pro", ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.lna-lightbox-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;           /* 触屏拖拽交给指针事件，避免被页面手势抢走 */
+}
+.lna-lightbox.is-dragging .lna-lightbox-stage { cursor: grabbing; }
+.lna-lightbox-img {
+  max-width: 92vw;
+  max-height: 92vh;
+  width: auto;
+  height: auto;
+  transform-origin: center center;
+  will-change: transform;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;         /* 关闭原生图片拖拽；所有指针交互由 stage 处理 */
+}
+.lna-lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 2;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .12);
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.lna-lightbox-close:hover { background: rgba(255, 255, 255, .26); }
+.lna-lightbox-close:focus-visible { outline: 2px solid #f97316; outline-offset: 2px; }
+.lna-lightbox-close svg { width: 20px; height: 20px; }
+.lna-lightbox-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 14px;
+  z-index: 2;
+  text-align: center;
+  color: rgba(255, 255, 255, .75);
+  font-size: 13px;
+  pointer-events: none;         /* 提示文字不遮挡点击 */
+}

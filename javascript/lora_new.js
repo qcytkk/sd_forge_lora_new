@@ -2,7 +2,8 @@
    无障碍要点：
    - 树节点/卡片可键盘聚焦与操作（Enter/Space）
    - 排序下拉为 role=listbox，支持上下键 + Escape
-   - 详情弹窗为 role=dialog + aria-modal，含焦点陷阱，Esc 关闭并回焦
+   - 详情弹窗为 role=dialog + aria-modal，含焦点陷阱，Esc 关闭并回焦（Esc 关闭带 400ms 冷却）
+   - 卡片设置弹窗的预览图可点开大图（滚轮缩放 / 拖拽 / WASD 移动，Esc 关闭）
    - 悬停出现的按钮在 :focus-within 时同样可见（见 style.css）
    - Toast 使用 aria-live=polite 播报 */
 (function () {
@@ -17,6 +18,7 @@
     preview: '/lora_new/api/preview',
     folderPreview: '/lora_new/api/folder_preview',
     openFolder: '/lora_new/api/open_folder',
+    reveal: '/lora_new/api/reveal',
     translate: '/lora_new/api/translate',
     translateStatus: '/lora_new/api/translate_status',
     llmModels: '/lora_new/api/llm_models',
@@ -219,6 +221,8 @@
     copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
     gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg>',
+    // 打开所在路径：文件夹 + 定位放大镜
+    reveal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><circle cx="10.5" cy="13" r="2.6"></circle><path d="m12.4 14.9 2.1 2.1"></path></svg>',
     info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v4.5"></path><path d="M12 16h.01"></path></svg>',
     // 翻译功能按钮图标：地球（翻译所有标签）
     translateAll: '<svg class="lna-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.2"></circle><ellipse cx="12" cy="12" rx="3.5" ry="8.2"></ellipse><path d="M4.4 9.2h15.2M4.4 14.8h15.2"></path></svg>',
@@ -759,6 +763,7 @@
       <div class="lna-layer-title" title="${esc(l.name)}">${esc(l.name)}</div>
       <div class="lna-card-actions">
         <button class="lna-icon-btn lna-copy" type="button" aria-label="复制 LoRA 路径：${esc(l.name)}" title="复制路径">${ICON.copy}</button>
+        <button class="lna-icon-btn lna-reveal" type="button" aria-label="打开所在路径：${esc(l.name)}" title="打开所在路径">${ICON.reveal}</button>
         <button class="lna-icon-btn lna-meta" type="button" aria-label="查看内部元数据：${esc(l.name)}" title="查看内部元数据">${ICON.info}</button>
         <button class="lna-icon-btn lna-cfg" type="button" aria-label="查看 LoRA 详情：${esc(l.name)}" title="卡片设置">${ICON.gear}<span>卡片</span></button>
       </div>
@@ -767,6 +772,10 @@
     el.querySelector('.lna-copy').addEventListener('click', (e) => {
       e.stopPropagation();
       copyText((state.root || '') + '\\' + l.rel);
+    });
+    el.querySelector('.lna-reveal').addEventListener('click', (e) => {
+      e.stopPropagation();
+      revealLora(l);
     });
     el.querySelector('.lna-cfg').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -787,6 +796,21 @@
       }
     });
     return el;
+  }
+
+  // 在资源管理器中打开模型所在文件夹，并自动选中该模型文件
+  async function revealLora(l) {
+    try {
+      const r = await fetch(API.reveal, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rel: l.rel }),
+      });
+      const res = await r.json();
+      if (!res || !res.ok) flashToast('打开失败：' + ((res && res.error) || '未知错误'));
+    } catch (e) {
+      flashToast('打开失败：请求出错');
+    }
   }
 
   // ---------- 顶部栏事件 ----------
@@ -884,7 +908,7 @@
       settings.addEventListener('click', () => {
         openModal({
           title: '插件设置',
-          locked: true, // 仅可通过「关闭」按钮关闭，防止误触
+          locked: true, // 仅可通过「关闭」按钮或 Esc 关闭（点击遮罩不关闭，防止误触）
           bodyHtml: `<div class="lna-set-group">
               <div class="lna-set-group-title">插件显示设置</div>
               <div class="lna-switch-row">
@@ -2196,6 +2220,7 @@
     }
     dlg.querySelector('.dlg-close').addEventListener('click', close);
     dlg.querySelector('[data-act="close"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
     mask.addEventListener('keydown', (e) => {
       if (e.key === 'Tab') trapFocus(e, dlg, close);
     });
@@ -2267,6 +2292,7 @@
     }
     dlg.querySelector('.dlg-close').addEventListener('click', close);
     dlg.querySelector('[data-act="close"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
     mask.addEventListener('keydown', (e) => {
       if (e.key === 'Tab') trapFocus(e, dlg, close);
     });
@@ -2760,6 +2786,7 @@
     // 锁定模式：仅关闭按钮可关；翻译在途时由 setDlgBusy 拦截点击并提示
     dlg.querySelector('.dlg-close').addEventListener('click', close);
     dlg.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
     mask.addEventListener('keydown', (e) => {
       if (e.key === 'Tab') trapFocus(e, dlg, close);
     });
@@ -2938,6 +2965,7 @@
     }
     dlg.querySelector('.dlg-close').addEventListener('click', close);
     dlg.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
     mask.addEventListener('keydown', (e) => {
       if (e.key === 'Tab') trapFocus(e, dlg, close);
     });
@@ -3104,6 +3132,7 @@
     }
     dlg.querySelector('.dlg-close').addEventListener('click', close);
     dlg.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
     mask.addEventListener('keydown', (e) => {
       if (e.key === 'Tab') trapFocus(e, dlg, close);
     });
@@ -3396,14 +3425,26 @@
       return;
     }
     body.innerHTML = cardFormHtml(info);
+    bindPreviewZoom(body, info.name || l.name);
 
     // 点标签 → 加入/移出触发词
     const act = body.querySelector('.lna-cf-activation');
+    // 触发词文本框 → 词条数组：按逗号切分并逐项去首尾空白。
+    // 不逐项去空白时，形如 " dildo riding, x" 的首项会带前导空格，与标签名对不上。
+    function actWords() {
+      return act.value.split(',').map((x) => x.trim()).filter(Boolean);
+    }
+    // 标签归一化：与后端 _normalize_tag 一致（去空白、转小写、空白→下划线）。
+    // ss_tag_frequency 与触发词里常出现「下划线 / 空格」两种写法（如 open_mouth / open mouth），
+    // 直接字符串比较会判成不同标签，导致标签不亮、且再次点击删不掉。
+    function normTag(s) {
+      return String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, '_');
+    }
     // 按触发词输入框内容同步所有标签的选中态（手动输入/删除也能点亮/熄灭标签）
     function syncTagSelected() {
-      const words = act.value.split(/\s*,\s*/).filter((x) => x.trim());
+      const keys = new Set(actWords().map(normTag));
       body.querySelectorAll('.lna-tag').forEach((b) => {
-        const on = words.includes(b.dataset.tag);
+        const on = keys.has(normTag(b.dataset.tag));
         b.classList.toggle('is-on', on);
         b.setAttribute('aria-pressed', on ? 'true' : 'false');
       });
@@ -3413,11 +3454,14 @@
     body.querySelectorAll('.lna-tag').forEach((btn) => {
       btn.addEventListener('click', () => {
         const tag = btn.dataset.tag;
-        const words = act.value.split(/\s*,\s*/).filter((x) => x.trim());
-        if (words.includes(tag)) {
-          act.value = words.filter((x) => x !== tag).join(', ');
+        const key = normTag(tag);
+        const words = actWords();
+        // 归一化比较：等价写法（下划线/空格、大小写、多空白）视为同一标签
+        const kept = words.filter((w) => normTag(w) !== key);
+        if (kept.length !== words.length) {
+          act.value = kept.join(', ');             // 已存在 → 移出（连同重复项与异形写法一并清掉）
         } else {
-          act.value = act.value.trim() ? act.value.replace(/\s*$/, '') + ', ' + tag : tag;
+          act.value = kept.concat(tag).join(', '); // 不存在 → 追加标签原文
         }
         syncTagSelected(); // 程序改 value 不触发 input 事件，手动同步
       });
@@ -3680,6 +3724,7 @@
       return;
     }
     body.innerHTML = folderFormHtml(info);
+    bindPreviewZoom(body, info.name || f.name);
 
     // 隐藏的文件选择器：替换文件夹封面
     fileInput = document.createElement('input');
@@ -3852,8 +3897,9 @@
       // locked 模式下点击遮罩不关闭，只能通过按钮关闭
       mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
     }
+    // Esc 关闭改由文档级监听统一处理（含 400ms 冷却，避免高频连点连续关窗），此处只保留焦点陷阱
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
     mask.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && !locked) { e.preventDefault(); close(); }
       if (e.key === 'Tab') trapFocus(e, dlg, close);
     });
     if (onOpen) onOpen(dlg);
@@ -4014,6 +4060,163 @@
       try { lastFocused.focus(); } catch (e) {}
     }
     lastFocused = null;
+  }
+
+  // ---------- Esc 关闭弹窗 ----------
+  // 文档级监听（捕获阶段）：无论焦点落在弹窗哪个位置都能收到 Esc。规则：
+  //   1) 只关「最上层」弹窗——先关嵌套小弹窗，再关主弹窗；
+  //   2) 关闭动作有 400ms 冷却，避免误触/高频连点把多层弹窗连着关光；
+  //   3) 翻译在途（弹窗被置为忙碌态 .lna-dlg-blocked）时拒绝关闭，防止推理被中断。
+  const ESC_CLOSE_COOLDOWN = 400;
+  let escClosedAt = 0;
+
+  function topEscDialog() {
+    const nested = document.querySelectorAll('.lna-modal-mask--nested');
+    if (nested.length) return nested[nested.length - 1]; // 后打开的排在 DOM 末尾，即最上层
+    return document.querySelector('.lna-modal-mask:not(.lna-modal-mask--nested)');
+  }
+
+  function onDocumentEsc(e) {
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    if (document.querySelector('.lna-lightbox')) return; // 大图预览在最上层，Esc 交给它自己处理
+    const mask = topEscDialog();
+    if (!mask) return; // 没开弹窗：交给其它 Esc 逻辑（如排序下拉）
+    e.preventDefault();
+    const closeBtn = mask.querySelector('.dlg-close');
+    if (closeBtn && closeBtn.classList.contains('lna-dlg-blocked')) {
+      flashToast('正在翻译中，暂时无法操作', true); // 与按钮拦截提示保持一致
+      return;
+    }
+    const now = Date.now();
+    if (now - escClosedAt < ESC_CLOSE_COOLDOWN) return; // 冷却期内忽略，防连点连续关窗
+    escClosedAt = now;
+    if (typeof mask.__lnaClose === 'function') mask.__lnaClose();
+  }
+
+  document.addEventListener('keydown', onDocumentEsc, true);
+
+  // ---------- 大图预览（点击卡片封面打开） ----------
+  // 交互：滚轮以光标为中心缩放；按住拖拽平移；WASD 键盘平移；Esc / 关闭按钮 / 点击图外关闭。
+  function openLightbox(src, name) {
+    if (document.querySelector('.lna-lightbox')) return; // 已打开则忽略重复点击
+    const box = document.createElement('div');
+    box.className = 'lna-lightbox';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-label', `预览大图：${name}`);
+    box.innerHTML = `
+      <div class="lna-lightbox-stage"><img class="lna-lightbox-img" src="${esc(src)}" alt="${esc(name)}" draggable="false"></div>
+      <button class="lna-lightbox-close" type="button" aria-label="关闭预览">${ICON.close}</button>
+      <div class="lna-lightbox-hint" aria-hidden="true">滚轮缩放 · 拖拽移动 · WASD 移动 · Esc 关闭</div>`;
+    document.body.appendChild(box);
+    lockScroll();
+    const prevFocus = document.activeElement; // 关闭后把焦点还给预览图
+
+    const stage = box.querySelector('.lna-lightbox-stage');
+    const img = box.querySelector('.lna-lightbox-img');
+    const MIN_SCALE = 0.2, MAX_SCALE = 12;
+    let scale = 1, tx = 0, ty = 0;
+    const apply = () => { img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; };
+
+    // 以光标为中心缩放：让光标下的点在缩放前后停留在屏幕同一位置。
+    // 图片经 flex 居中，其几何中心即 stage 中心，故位移按中心坐标换算。
+    function zoomAt(mx, my, factor) {
+      const s2 = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale * factor));
+      if (s2 === scale) return;
+      const r = stage.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const k = s2 / scale;
+      tx = (mx - cx) * (1 - k) + k * tx;
+      ty = (my - cy) * (1 - k) + k * ty;
+      scale = s2;
+      apply();
+    }
+
+    stage.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    }, { passive: false });
+
+    // 拖拽平移（指针事件统一处理鼠标 / 触屏 / 触控笔）
+    let dragging = false, moved = false, sx = 0, sy = 0, stx = 0, sty = 0;
+    stage.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      dragging = true; moved = false;
+      sx = e.clientX; sy = e.clientY; stx = tx; sty = ty;
+      try { stage.setPointerCapture(e.pointerId); } catch (err) {}
+      box.classList.add('is-dragging');
+    });
+    stage.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      tx = stx + (e.clientX - sx);
+      ty = sty + (e.clientY - sy);
+      if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) moved = true;
+      apply();
+    });
+    const endDrag = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      try { stage.releasePointerCapture(e.pointerId); } catch (err) {}
+      box.classList.remove('is-dragging');
+    };
+    stage.addEventListener('pointerup', endDrag);
+    stage.addEventListener('pointercancel', endDrag);
+
+    // 点击图片外的空白区域关闭（刚拖拽完的这次点击不算作“点击”）
+    box.addEventListener('click', (e) => {
+      if (moved || e.target.closest('.lna-lightbox-close')) return;
+      const r = img.getBoundingClientRect();
+      const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+      if (!inside) close();
+    });
+
+    // 键盘：WASD 平移（按住 Shift 加速），Esc 关闭
+    const STEP = 32;
+    function onKey(e) {
+      if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+      const step = e.shiftKey ? STEP * 2.5 : STEP;
+      const k = e.key.toLowerCase();
+      if (k === 'w') ty -= step;
+      else if (k === 's') ty += step;
+      else if (k === 'a') tx -= step;
+      else if (k === 'd') tx += step;
+      else return;
+      e.preventDefault();
+      apply();
+    }
+    document.addEventListener('keydown', onKey, true);
+
+    function close() {
+      if (!document.contains(box)) return;
+      document.removeEventListener('keydown', onKey, true);
+      box.remove();
+      unlockScroll();
+      if (prevFocus && document.contains(prevFocus)) {
+        try { prevFocus.focus(); } catch (e) {}
+      }
+    }
+    box.querySelector('.lna-lightbox-close').addEventListener('click', close);
+    box.querySelector('.lna-lightbox-close').focus();
+  }
+
+  // 卡片设置弹窗右侧预览图：有图时可点击（或回车）打开大图预览。
+  // 图片地址在点击时从元素当前的 background-image 读取，替换/重新生成预览图后依旧取到新图。
+  function bindPreviewZoom(scope, name) {
+    const pv = scope.querySelector('.lna-cf-preview');
+    if (!pv) return;
+    const open = () => {
+      const m = /url\((['"]?)(.*?)\1\)/.exec(pv.style.backgroundImage || '');
+      if (m && m[2]) openLightbox(m[2], name);
+    };
+    pv.addEventListener('click', open);
+    if (pv.classList.contains('is-empty')) return; // 无预览图：保持纯占位，不设可聚焦/提示
+    pv.setAttribute('role', 'button');
+    pv.setAttribute('tabindex', '0');
+    pv.setAttribute('aria-label', `预览大图：${name}`);
+    pv.title = '点击预览大图';
+    pv.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
   }
 
   // ---------- Toast ----------

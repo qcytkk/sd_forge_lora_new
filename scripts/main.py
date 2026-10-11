@@ -1080,7 +1080,8 @@ LLM_USER_PROMPT = """把下面的英文 danbooru 标签逐个翻译成简体中�
 规则：
 1. 输出一个 JSON 对象：key 必须与给出的英文原文完全一致，value 为简体中文译文。
 2. 使用 AI 绘画圈的通用译法，例如 "looking at viewer" 译为"看向观者"，"thighhighs" 译为"过膝袜"。
-3. 角色名、作品名、以及无法翻译的自造触发词（如 kei1、my_style_v2）原样返回英文。
+3. 只有「不含空格且含数字」的自造触发词（如 kei1、my_style_v2）才原样返回英文；
+   其余标签都要翻译，用下划线连接的常见 danbooru 标签（如 open_mouth、long_hair、tentacle_sex）也要译成中文。
 4. 不要输出 JSON 以外的任何内容。
 
 标签列表：
@@ -2427,6 +2428,21 @@ def _open_in_explorer(abs_dir: Path) -> str | None:
     return None
 
 
+def _reveal_in_explorer(abs_path: Path) -> str | None:
+    """在系统文件管理器中打开所在文件夹并选中该文件；成功返回 None，失败返回错误文案。"""
+    try:
+        if os.name == "nt":
+            # explorer 的 /select 参数要求逗号后紧跟目标路径；成功时也可能返回非 0，故不检查退出码
+            subprocess.Popen(["explorer", "/select," + str(abs_path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(abs_path)])
+        else:
+            subprocess.Popen(["xdg-open", str(abs_path.parent)])
+    except Exception as e:
+        return f"打开失败：{e}"
+    return None
+
+
 def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     if LORA_DIR.exists():
         app.mount("/lora_new_files", StaticFiles(directory=str(LORA_DIR)), name="lora_new_files")
@@ -2474,6 +2490,20 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         if err:
             return {"ok": False, "error": err}
         return {"ok": True, "path": str(abs_dir)}
+
+    @app.post("/lora_new/api/reveal")
+    def api_reveal(payload: dict):
+        """在资源管理器中打开模型所在文件夹，并自动选中该模型文件。"""
+        safe = _safe_rel(payload.get("rel", ""))
+        if not safe:
+            return {"ok": False, "error": "无效的文件路径"}
+        abs_path = LORA_DIR / safe
+        if not abs_path.is_file():
+            return {"ok": False, "error": "文件不存在"}
+        err = _reveal_in_explorer(abs_path)
+        if err:
+            return {"ok": False, "error": err}
+        return {"ok": True, "path": str(abs_path)}
 
     @app.post("/lora_new/api/llm_open_folder")
     def api_llm_open_folder():
