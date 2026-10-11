@@ -48,16 +48,115 @@
     syncOldJsonOverwrite: '/lora_new/api/sync_old_json_overwrite',
     syncOldJsonCompare: '/lora_new/api/sync_old_json_compare',
     syncOldJsonUnify: '/lora_new/api/sync_old_json_unify',
+    i18n: '/lora_new/api/i18n',
+    uiLang: '/lora_new/api/ui_lang',
   };
 
+  // ---------- 界面多语言（i18n） ----------
+  // 语言包由后端 /lora_new/api/i18n 下发（唯一数据源），前端只做查找与 {占位符} 插值。
+  // 拉取失败时 dict 为空，t() 原样返回 key，界面回落为 key 文本，不影响任何功能。
+  const I18N = { lang: '', available: [], dict: {} };
+  // 语言代码 → 显示名（下拉框用；新增语言时在此补一行即可，未登记则显示原始代码）
+  const LANG_NAMES = { zh_CN: '简体中文', zh_TW: '繁體中文', en_US: 'English', ja_JP: '日本語', ko_KR: '한국어', fr_FR: 'Français', ru_RU: 'Русский' };
+
+  function t(key, vars) {
+    if (key == null) return '';
+    const s = I18N.dict[key];
+    if (s == null) return key;
+    if (!vars) return s;
+    return s.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  }
+
+  function langName(code) {
+    return LANG_NAMES[code] || code;
+  }
+
+  // 启动时拉取当前语言的语言包（在首次渲染之前调用）
+  async function loadI18n() {
+    try {
+      const r = await fetch(API.i18n);
+      const res = await r.json();
+      if (res && res.dict) {
+        I18N.lang = res.lang || '';
+        I18N.available = Array.isArray(res.available) ? res.available : [];
+        I18N.dict = res.dict;
+      }
+    } catch (e) {}
+  }
+
+  // 切换界面语言：写后端（持久化）→ 更新本地字典 → 重渲染当前视图
+  async function switchLang(code) {
+    if (code === I18N.lang) return;
+    try {
+      const r = await fetch(API.uiLang, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lang: code }),
+      });
+      const res = await r.json();
+      if (!res || !res.dict) throw new Error('bad response');
+      I18N.lang = res.lang || code;
+      I18N.available = Array.isArray(res.available) ? res.available : I18N.available;
+      I18N.dict = res.dict;
+    } catch (e) {
+      flashToast(t('toast.langFailed'), true);
+      return false;
+    }
+    // 先重建骨架（刷新顶栏等挂载期生成的文案），再整体重渲染树与卡片
+    rebuildSkeleton();
+    renderFull(getActiveRoot());
+    flashToast(t('settings.lang.switched'));
+    return true;
+  }
+
+  // ---------- 屏蔽 Forge 全局界面本地化对本插件的干扰 ----------
+  // Forge 的 javascript/localization.js 会在每次 UI 更新时遍历新增节点，把文本与
+  // 它自己的界面语言词典做「精确整串匹配」，命中就直接覆盖文本（见其 processTextNode）。
+  // WebUI 界面语言为中文时，"Filename"/"Refresh" 等词会被强制改回中文，与本插件的
+  // 语言选择打架，出现同一界面中英文混杂。这里包一层 processNode，跳过本插件的节点，
+  // 让插件文案完全由自身语言包决定（不改动任何 Forge 文件，仅内存内包装）。
+  const LOCALIZE_SKIP_SEL = '.lna-root, .lna-modal-mask, .lna-lightbox, .lna-toast, .lna-dd-menu, .lna-dd-mask';
+
+  function installLocalizationGuard() {
+    const orig = window.processNode;
+    if (typeof orig !== 'function' || orig.__lna_guard) return false;
+    const wrapped = function (node) {
+      try {
+        const el = node && (node.nodeType === 1 ? node : node.parentElement);
+        if (el && el.closest && el.closest(LOCALIZE_SKIP_SEL)) return; // 本插件节点：由插件自身语言包决定文案
+      } catch (e) { /* 判定失败则按原逻辑处理 */ }
+      return orig.apply(this, arguments);
+    };
+    wrapped.__lna_guard = true;
+    window.processNode = wrapped;
+    return true;
+  }
+
+  // localization.js 可能晚于本脚本加载，故有限次重试直到包装成功
+  function ensureLocalizationGuard() {
+    if (installLocalizationGuard()) return;
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (installLocalizationGuard() || ++tries > 40) clearInterval(timer);
+    }, 250);
+  }
+
+  // 脚本加载即尝试安装（此时 Forge 核心脚本通常已就绪）
+  ensureLocalizationGuard();
+
   const SORT_OPTIONS = [
-    { value: 'name',        label: '文件名' },
-    { value: 'created',     label: '创建日期' },
-    { value: 'modified',    label: '修改日期' },
-    { value: 'size',        label: '文件大小' },
-    { value: 'usage_count', label: '使用次数' },
-    { value: 'last_viewed', label: '最近查看' },
+    { value: 'name' },
+    { value: 'created' },
+    { value: 'modified' },
+    { value: 'size' },
+    { value: 'usage_count' },
+    { value: 'last_viewed' },
   ];
+
+  // 排序项显示名（i18n：sort.<value>）
+  function sortLabel(value) {
+    return t('sort.' + value);
+  }
 
   // 共享状态（txt2img 和 img2img 两个实例共用）
   const state = {
@@ -110,10 +209,11 @@
   const IDLE_MAX = 200;
   const IDLE_DEFAULT = 5;
   // 标签翻译方案（与后端 TRANS_MODES 保持一致）：dict=仅用对照表 / llm=仅用模型 / hybrid=混合
+  // 显示名走 i18n（settings.mode.<v>），故此处只保留取值
   const TRANS_MODES = [
-    { v: 'dict', label: '仅用翻译词典' },
-    { v: 'llm', label: '仅用模型翻译' },
-    { v: 'hybrid', label: '使用混合翻译' },
+    { v: 'dict' },
+    { v: 'llm' },
+    { v: 'hybrid' },
   ];
   const TRANS_MODE_DEFAULT = 'hybrid';
   // 翻译提示预设：名称长度上限（与后端 PROMPT_NAME_MAX 保持一致）
@@ -237,65 +337,68 @@
   };
 
   // ---------- HTML 模板（用 class，不用 id） ----------
-  const TAB_HTML = `
+  // 注意：必须做成函数而非常量 —— 其中含 t() 取值，需在语言包加载完成后（挂载时）才求值。
+  function tabHtml() {
+    return `
 <div class="lna-root">
-  <div class="lna-topbar" role="toolbar" aria-label="LoRA 管理器工具栏">
+  <div class="lna-topbar" role="toolbar" aria-label="${esc(t('toolbar.aria'))}">
     <div class="lna-search-wrap">
       <svg class="lna-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
-      <input class="lna-search" type="search" placeholder="搜索 LoRA 文件名..." aria-label="搜索 LoRA 文件名">
-      <button class="lna-search-clear" type="button" aria-label="清除搜索内容" title="清除搜索内容" hidden>
+      <input class="lna-search" type="search" placeholder="${esc(t('search.placeholder'))}" aria-label="${esc(t('search.aria'))}">
+      <button class="lna-search-clear" type="button" aria-label="${esc(t('search.clear'))}" title="${esc(t('search.clear'))}" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg>
       </button>
     </div>
     <div class="pill-group pill-sm lna-sort">
-      <span class="group-label" id="{UID}-sort-label">排序</span>
+      <span class="group-label" id="{UID}-sort-label">${t('sort.label')}</span>
       <div class="base-dropdown">
         <button class="dd-trigger lna-sort-trigger" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="{UID}-sort-label {UID}-sort-value">
-          <span class="dd-value lna-sort-value" id="{UID}-sort-value">文件名</span>
+          <span class="dd-value lna-sort-value" id="{UID}-sort-value">${t('sort.name')}</span>
           <span class="arrow"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></span>
         </button>
       </div>
-      <button class="dir-btn lna-sort-dir" aria-label="排序方向：降序">
+      <button class="dir-btn lna-sort-dir" aria-label="${esc(t('sort.dirAria', { dir: t('sort.dirDesc') }))}">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="lna-sort-arrow" d="M12 5v14M19 12l-7 7-7-7"></path></svg>
       </button>
     </div>
-    <button class="lna-top-btn lna-refresh" aria-label="刷新：重新扫描磁盘">
+    <button class="lna-top-btn lna-refresh" aria-label="${esc(t('refresh.aria'))}">
       <svg class="lna-refresh-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"></path><path d="M21 3v5h-5"></path></svg>
-      <span class="lna-refresh-label">刷新</span>
+      <span class="lna-refresh-label">${t('refresh.label')}</span>
     </button>
-    <button class="lna-top-btn lna-settings" aria-label="插件设置">
+    <button class="lna-top-btn lna-settings" aria-label="${esc(t('settings.aria'))}">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-      <span>插件设置</span>
+      <span>${t('settings.aria')}</span>
     </button>
-    <button class="lna-top-btn lna-llm-state" type="button" aria-label="翻译模型状态" disabled>
+    <button class="lna-top-btn lna-llm-state" type="button" aria-label="${esc(t('llmState.aria'))}" disabled>
       <span class="lna-llm-state-dot" aria-hidden="true"></span>
-      <span class="lna-llm-state-text lna-llm-state-off">翻译模型未加载</span>
-      <span class="lna-llm-state-text lna-llm-state-on">翻译模型已加载</span>
-      <span class="lna-llm-state-text lna-llm-state-hover">卸载翻译模型</span>
+      <span class="lna-llm-state-text lna-llm-state-off">${t('llmState.off')}</span>
+      <span class="lna-llm-state-text lna-llm-state-on">${t('llmState.on')}</span>
+      <span class="lna-llm-state-text lna-llm-state-hover">${t('llmState.hover')}</span>
     </button>
     <div class="lna-stats">
-      <span class="lna-stat" title="LoRA 文件夹（含所有子文件夹）的模型总数">
-        <span class="lna-stat-label">Lora模型总数</span>
+      <span class="lna-stat" title="${esc(t('stats.countTitle'))}">
+        <span class="lna-stat-label">${t('stats.countLabel')}</span>
         <span class="lna-stat-value lna-stat-count">—</span>
       </span>
-      <span class="lna-stat" title="LoRA 文件夹（含所有子文件夹）的模型总大小">
-        <span class="lna-stat-label">Lora模型总大小</span>
+      <span class="lna-stat" title="${esc(t('stats.sizeTitle'))}">
+        <span class="lna-stat-label">${t('stats.sizeLabel')}</span>
         <span class="lna-stat-value lna-stat-size">—</span>
       </span>
     </div>
   </div>
   <div class="lna-body">
     <aside class="lna-sidebar">
-      <div class="lna-side-title" id="{UID}-tree-label">文件夹</div>
+      <div class="lna-side-title" id="{UID}-tree-label">${t('sidebar.title')}</div>
       <div class="lna-tree" role="tree" aria-labelledby="{UID}-tree-label"></div>
     </aside>
     <main class="lna-content">
-      <nav class="lna-crumb" aria-label="面包屑导航"></nav>
-      <div class="lna-grid" role="list" aria-label="LoRA 与文件夹列表"></div>
-      <div class="lna-empty" role="status" style="display:none">此文件夹为空</div>
+      <nav class="lna-crumb" aria-label="${esc(t('crumb.aria'))}"></nav>
+      <div class="lna-grid" role="list" aria-label="${esc(t('grid.aria'))}"></div>
+      <div class="lna-empty" role="status" style="display:none">${t('empty.folder')}</div>
     </main>
   </div>
 </div>`;
+  }
 
   let uidCounter = 0;
 
@@ -391,7 +494,7 @@
       host.appendChild(mount);
     }
     if (mount.querySelector('.lna-root')) return false; // 已挂载
-    mount.innerHTML = TAB_HTML.replace(/\{UID\}/g, 'lna' + (++uidCounter));
+    mount.innerHTML = tabHtml().replace(/\{UID\}/g, 'lna' + (++uidCounter));
     renderFull(mount.querySelector('.lna-root'));
     return true;
   }
@@ -411,6 +514,15 @@
   function startMountWatch() {
     if (mountTimer) return;
     mountTimer = setInterval(ensureMounted, 700);
+  }
+
+  // 整体重建已挂载的骨架：顶栏、搜索框、排序、按钮等文案由 tabHtml() 在挂载时求值，
+  // 语言切换后必须重建这些节点才能刷新（仅 renderFull 只更新树与卡片区）。
+  function rebuildSkeleton() {
+    document.querySelectorAll('.lna-mount').forEach((m) => {
+      if (m.querySelector('.lna-root')) m.innerHTML = ''; // 清空后由 mountPage 重新生成
+    });
+    ensureMounted();
   }
 
   // ---------- 数据加载 ----------
@@ -461,7 +573,7 @@
     } catch (e) {
       if (seq !== searchSeq) return;
       state.searchResults = { folders: [], loras: [] };
-      flashToast('递归搜索接口不可用，请在页脚点击「重载 UI」后重试');
+      flashToast(t('toast.recursiveFailed'));
     }
     renderAll();
   }
@@ -488,7 +600,7 @@
     if (!box) return;
     box.innerHTML = '';
     // 展开状态由 makeTreeNode 依据 state.expandedFolders 恢复
-    const rootNode = makeTreeNode({ name: 'Lora (根)', rel: '', children: state.tree, count: state.rootCount, total: state.totalCount }, 0, true);
+    const rootNode = makeTreeNode({ name: t('tree.root'), rel: '', children: state.tree, count: state.rootCount, total: state.totalCount }, 0, true);
     box.appendChild(rootNode);
     syncTreeActive();
   }
@@ -511,10 +623,10 @@
     // 递归展示的模型数对等），关闭时显示直属数量
     const recursive = !!state.showAllModels;
     const count = recursive ? (Number(node.total ?? node.count) || 0) : (Number(node.count) || 0); // 后端未重启时无 total 字段，回退直属数量
-    const countTitle = recursive ? '该文件夹及所有子文件夹的模型数量' : '该文件夹直属的模型数量';
+    const countTitle = recursive ? t('tree.countTotalTitle') : t('tree.countDirectTitle');
     const countAria = recursive
-      ? `含子文件夹共 ${count} 个模型`
-      : `直属模型 ${count} 个${hasChildren ? '，含子文件夹' : ''}`;
+      ? t('tree.countAriaTotal', { n: count })
+      : (hasChildren ? t('tree.countAriaDirectSub', { n: count }) : t('tree.countAriaDirect', { n: count }));
 
     const row = document.createElement('div');
     row.className = 'lna-tree-node' + (isExpanded ? ' expanded' : '');
@@ -524,7 +636,7 @@
     row.setAttribute('tabindex', '0');
     row.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
     row.setAttribute('aria-level', String(depth + 1));
-    row.setAttribute('aria-label', `${node.name}（文件夹，${countAria}）`);
+    row.setAttribute('aria-label', t('tree.nodeAria', { name: node.name, desc: countAria }));
     row.innerHTML = `
       <span class="twisty ${hasChildren ? '' : 'twisty-empty'}" aria-hidden="true">${ICON.chevron}</span>
       ${ICON.folder}
@@ -644,10 +756,10 @@
 
     if (folders.length === 0 && loras.length === 0) {
       empty.style.display = 'block';
-      if (q) empty.textContent = '没有匹配的结果';
+      if (q) empty.textContent = t('empty.noMatch');
       // 隐藏了文件夹卡片且当前目录确实有子文件夹时，不要误报「为空」
-      else if (!state.showFolderCards && state.folders.length > 0) empty.textContent = '文件夹卡片已隐藏，可在插件设置中开启';
-      else empty.textContent = '此文件夹为空';
+      else if (!state.showFolderCards && state.folders.length > 0) empty.textContent = t('empty.folderCardsHidden');
+      else empty.textContent = t('empty.folder');
       grid.style.display = 'none';
       return;
     }
@@ -697,20 +809,20 @@
     el.className = 'lna-card folder';
     el.setAttribute('role', 'listitem');
     el.setAttribute('tabindex', '0');
-    el.setAttribute('aria-label', `文件夹：${f.name}，按 Enter 打开`);
+    el.setAttribute('aria-label', t('folder.cardAria', { name: f.name }));
     // 与 LoRA 卡一致：受「卡片图像预览」开关控制，关闭时隐藏封面层露出占位层
     const coverBg = state.showPreviews && f.preview ? `background-image:url('${previewUrl(f.preview, f.preview_ver)}')` : '';
     const coverStyle = coverBg + (state.showPreviews ? '' : 'display:none;');
     el.innerHTML = `
       <div class="lna-layer-base" aria-hidden="true">
-        <div class="base-tag">文件夹</div>
-        <div class="base-hint">暂无封面</div>
+        <div class="base-tag">${t('folder.baseTag')}</div>
+        <div class="base-hint">${t('card.noCover')}</div>
       </div>
       <div class="lna-layer-cover" style="${coverStyle}"></div>
       <div class="lna-layer-title">${esc(f.name)}</div>
       <div class="lna-card-actions">
-        <button class="lna-icon-btn lna-copy" type="button" aria-label="复制文件夹路径：${esc(f.name)}" title="复制路径">${ICON.copy}</button>
-        <button class="lna-icon-btn lna-cfg" type="button" aria-label="查看文件夹详情：${esc(f.name)}" title="卡片设置">${ICON.gear}<span>卡片</span></button>
+        <button class="lna-icon-btn lna-copy" type="button" aria-label="${esc(t('folder.copyPathAria', { name: f.name }))}" title="${esc(t('card.copyPathTitle'))}">${ICON.copy}</button>
+        <button class="lna-icon-btn lna-cfg" type="button" aria-label="${esc(t('folder.detailAria', { name: f.name }))}" title="${esc(t('card.cfgTitle'))}">${ICON.gear}<span>${t('card.cfgLabel')}</span></button>
       </div>
     `;
     el.addEventListener('click', (e) => {
@@ -744,7 +856,7 @@
     el.className = 'lna-card lora';
     el.setAttribute('role', 'listitem');
     el.setAttribute('tabindex', '0');
-    el.setAttribute('aria-label', `LoRA：${l.name}，大小 ${fmtSize(l.size)}，使用 ${l.usage_count} 次`);
+    el.setAttribute('aria-label', t('card.loraAria', { name: l.name, size: fmtSize(l.size), count: l.usage_count }));
     // 关闭「卡片图像预览」时不引用预览图，并隐藏封面层（z-index 2），露出「暂无封面」占位层（z-index 1）
     const coverBg = state.showPreviews && l.preview ? `background-image:url('${previewUrl(l.preview, l.preview_ver)}')` : '';
     const coverStyle = coverBg + (state.showPreviews ? '' : 'display:none;');
@@ -756,18 +868,18 @@
     el.innerHTML = `
       <div class="lna-layer-base" aria-hidden="true">
         <div class="base-tag">LORA</div>
-        <div class="base-hint">暂无封面</div>
+        <div class="base-hint">${t('card.noCover')}</div>
       </div>
-      <div class="lna-layer-cover" style="${coverStyle}" role="img" aria-label="${esc(l.name)} 封面"></div>
+      <div class="lna-layer-cover" style="${coverStyle}" role="img" aria-label="${esc(t('card.coverAria', { name: l.name }))}"></div>
       ${descHtml}
       <div class="lna-layer-title" title="${esc(l.name)}">${esc(l.name)}</div>
       <div class="lna-card-actions">
-        <button class="lna-icon-btn lna-copy" type="button" aria-label="复制 LoRA 路径：${esc(l.name)}" title="复制路径">${ICON.copy}</button>
-        <button class="lna-icon-btn lna-reveal" type="button" aria-label="打开所在路径：${esc(l.name)}" title="打开所在路径">${ICON.reveal}</button>
-        <button class="lna-icon-btn lna-meta" type="button" aria-label="查看内部元数据：${esc(l.name)}" title="查看内部元数据">${ICON.info}</button>
-        <button class="lna-icon-btn lna-cfg" type="button" aria-label="查看 LoRA 详情：${esc(l.name)}" title="卡片设置">${ICON.gear}<span>卡片</span></button>
+        <button class="lna-icon-btn lna-copy" type="button" aria-label="${esc(t('card.copyLoraAria', { name: l.name }))}" title="${esc(t('card.copyPathTitle'))}">${ICON.copy}</button>
+        <button class="lna-icon-btn lna-reveal" type="button" aria-label="${esc(t('card.revealAria', { name: l.name }))}" title="${esc(t('card.revealTitle'))}">${ICON.reveal}</button>
+        <button class="lna-icon-btn lna-meta" type="button" aria-label="${esc(t('card.metaAria', { name: l.name }))}" title="${esc(t('card.metaTitle'))}">${ICON.info}</button>
+        <button class="lna-icon-btn lna-cfg" type="button" aria-label="${esc(t('card.detailAria', { name: l.name }))}" title="${esc(t('card.cfgTitle'))}">${ICON.gear}<span>${t('card.cfgLabel')}</span></button>
       </div>
-      <button class="lna-use-btn" type="button" aria-label="将 ${esc(l.name)} 的触发词添加到正提示词框、反向提示词添加到负提示词框">使用 Lora 提示词</button>
+      <button class="lna-use-btn" type="button" aria-label="${esc(t('card.useAria', { name: l.name }))}">${t('card.useLabel')}</button>
     `;
     el.querySelector('.lna-copy').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -807,9 +919,9 @@
         body: JSON.stringify({ rel: l.rel }),
       });
       const res = await r.json();
-      if (!res || !res.ok) flashToast('打开失败：' + ((res && res.error) || '未知错误'));
+      if (!res || !res.ok) flashToast(t('toast.openFailed', { msg: (res && res.error) || t('toast.unknownError') }));
     } catch (e) {
-      flashToast('打开失败：请求出错');
+      flashToast(t('toast.openFailedReq'));
     }
   }
 
@@ -877,7 +989,7 @@
           );
         }
         if (label) {
-          label.textContent = '刷新中...';
+          label.textContent = t('refresh.busy');
           label.classList.add('busy');
         }
         refresh.setAttribute('aria-busy', 'true');
@@ -886,7 +998,7 @@
           await loadTree();
           await loadDir(state.currentPath);
           renderFull(getActiveRoot());
-          flashToast('已重新扫描');
+          flashToast(t('refresh.done'));
         } finally {
           // 至少播完一圈动画再恢复文字（减弱动效时不等待）
           const wait = reduced ? 0 : Math.max(0, MIN_DUR - (performance.now() - t0));
@@ -894,7 +1006,7 @@
           if (label) {
             label.classList.remove('busy'); // max-width 平滑收缩
             setTimeout(() => {
-              if (!refresh.__lna_busy) label.textContent = '刷新'; // 期间若再次点击则不覆盖
+              if (!refresh.__lna_busy) label.textContent = t('refresh.label'); // 期间若再次点击则不覆盖
             }, 250);
           }
           refresh.removeAttribute('aria-busy');
@@ -907,243 +1019,267 @@
       settings.__lna_bound = true;
       settings.addEventListener('click', () => {
         openModal({
-          title: '插件设置',
+          title: t('settings.title'),
           locked: true, // 仅可通过「关闭」按钮或 Esc 关闭（点击遮罩不关闭，防止误触）
           bodyHtml: `<div class="lna-set-group">
-              <div class="lna-set-group-title">插件显示设置</div>
+              <div class="lna-set-group-title">${t('settings.group.display')}</div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">树状文件夹菜单宽度</span>
-                  <span class="lna-switch-desc">单位 px，范围 ${SIDEBAR_MIN}–${SIDEBAR_MAX}，点击「保存」后生效。</span>
+                  <span class="lna-switch-name">${t('settings.lang.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.lang.desc')}</span>
                 </span>
                 <div class="lna-inline-group">
-                  <input type="number" class="lna-size-input lna-sidebar-input" min="${SIDEBAR_MIN}" max="${SIDEBAR_MAX}" step="1" value="${state.sidebarWidth}" aria-label="树状文件夹菜单宽度（px）">
-                  <button class="dlg-btn primary lna-sidebar-save" type="button">保存</button>
+                  <select class="lna-lang-select" aria-label="${t('settings.lang.aria')}">
+                    ${I18N.available.map((c) => `<option value="${c}"${c === I18N.lang ? ' selected' : ''}>${esc(langName(c))}</option>`).join('')}
+                  </select>
                 </div>
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">内容区高度</span>
-                  <span class="lna-switch-desc">调整左侧文件夹树与右侧 LoRA 卡片区容器的高度，单位 px，范围 ${BODY_H_MIN}–${BODY_H_MAX}，点击「保存」后生效。</span>
+                  <span class="lna-switch-name">${t('settings.sidebar.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.sidebar.desc', { min: SIDEBAR_MIN, max: SIDEBAR_MAX })}</span>
                 </span>
                 <div class="lna-inline-group">
-                  <input type="number" class="lna-size-input lna-body-input" min="${BODY_H_MIN}" max="${BODY_H_MAX}" step="1" value="${state.bodyHeight}" aria-label="内容区高度（px）">
-                  <button class="dlg-btn primary lna-body-save" type="button">保存</button>
+                  <input type="number" class="lna-size-input lna-sidebar-input" min="${SIDEBAR_MIN}" max="${SIDEBAR_MAX}" step="1" value="${state.sidebarWidth}" aria-label="${t('settings.sidebar.aria')}">
+                  <button class="dlg-btn primary lna-sidebar-save" type="button">${t('settings.save')}</button>
+                </div>
+              </div>
+              <div class="lna-switch-row">
+                <span class="lna-switch-text">
+                  <span class="lna-switch-name">${t('settings.bodyH.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.bodyH.desc', { min: BODY_H_MIN, max: BODY_H_MAX })}</span>
+                </span>
+                <div class="lna-inline-group">
+                  <input type="number" class="lna-size-input lna-body-input" min="${BODY_H_MIN}" max="${BODY_H_MAX}" step="1" value="${state.bodyHeight}" aria-label="${t('settings.bodyH.aria')}">
+                  <button class="dlg-btn primary lna-body-save" type="button">${t('settings.save')}</button>
                 </div>
               </div>
               <label class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">文件夹卡片显示</span>
-                  <span class="lna-switch-desc">关闭后，卡片列表不再显示文件夹卡片（左侧文件夹树仍可正常导航）。</span>
+                  <span class="lna-switch-name">${t('settings.folderCards.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.folderCards.desc')}</span>
                 </span>
-                <input type="checkbox" class="lna-switch" data-set="showFolderCards" ${state.showFolderCards ? 'checked' : ''} aria-label="文件夹卡片显示">
+                <input type="checkbox" class="lna-switch" data-set="showFolderCards" ${state.showFolderCards ? 'checked' : ''} aria-label="${t('settings.folderCards.name')}">
               </label>
               <label class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">卡片图像预览</span>
-                  <span class="lna-switch-desc">关闭后，即使卡片存在预览图也不引用，改为显示「暂无封面」占位。</span>
+                  <span class="lna-switch-name">${t('settings.previews.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.previews.desc')}</span>
                 </span>
-                <input type="checkbox" class="lna-switch" data-set="showPreviews" ${state.showPreviews ? 'checked' : ''} aria-label="卡片图像预览">
+                <input type="checkbox" class="lna-switch" data-set="showPreviews" ${state.showPreviews ? 'checked' : ''} aria-label="${t('settings.previews.name')}">
               </label>
               <label class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">显示文件夹下所有模型</span>
-                  <span class="lna-switch-desc">开启后无需搜索，卡片列表直接递归显示当前路径下所有子文件夹里的模型。</span>
+                  <span class="lna-switch-name">${t('settings.allModels.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.allModels.desc')}</span>
                 </span>
-                <input type="checkbox" class="lna-switch" data-set="showAllModels" ${state.showAllModels ? 'checked' : ''} aria-label="显示文件夹下所有模型">
+                <input type="checkbox" class="lna-switch" data-set="showAllModels" ${state.showAllModels ? 'checked' : ''} aria-label="${t('settings.allModels.name')}">
               </label>
             </div>
             <div class="lna-set-group">
-              <div class="lna-set-group-title">搜索设置</div>
+              <div class="lna-set-group-title">${t('settings.group.search')}</div>
               <label class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">搜索子文件夹</span>
-                  <span class="lna-switch-desc">开启后，搜索范围包含当前路径下的所有子文件夹（递归）。</span>
+                  <span class="lna-switch-name">${t('settings.searchSub.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.searchSub.desc')}</span>
                 </span>
-                <input type="checkbox" class="lna-switch" data-set="searchSubfolders" ${state.searchSubfolders ? 'checked' : ''} aria-label="搜索子文件夹">
+                <input type="checkbox" class="lna-switch" data-set="searchSubfolders" ${state.searchSubfolders ? 'checked' : ''} aria-label="${t('settings.searchSub.name')}">
               </label>
               <label class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">只搜索 LoRA 模型</span>
-                  <span class="lna-switch-desc">开启后，搜索结果只显示模型文件，不含文件夹卡片。</span>
+                  <span class="lna-switch-name">${t('settings.onlyLora.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.onlyLora.desc')}</span>
                 </span>
-                <input type="checkbox" class="lna-switch" data-set="onlyLora" ${state.onlyLora ? 'checked' : ''} aria-label="只搜索 LoRA 模型">
+                <input type="checkbox" class="lna-switch" data-set="onlyLora" ${state.onlyLora ? 'checked' : ''} aria-label="${t('settings.onlyLora.name')}">
               </label>
             </div>
             <div class="lna-set-group">
-              <div class="lna-set-group-title">卡片样式调整</div>
+              <div class="lna-set-group-title">${t('settings.group.cardStyle')}</div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">比例预设</span>
-                  <span class="lna-switch-desc">按所选比例调整高度，宽度保持当前值不变。</span>
+                  <span class="lna-switch-name">${t('settings.ratio.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.ratio.desc')}</span>
                 </span>
-                <div class="lna-ratio-group" role="group" aria-label="卡片比例预设">
+                <div class="lna-ratio-group" role="group" aria-label="${t('settings.ratio.aria')}">
                   ${CARD_RATIOS.map((r) => `<button class="lna-ratio-btn" type="button" data-ratio="${r.label}" aria-pressed="false">${r.label}</button>`).join('')}
                 </div>
               </div>
               <label class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">锁定比例</span>
-                  <span class="lna-switch-desc">开启后，修改宽度或高度时另一项按当前比例自动联动。</span>
+                  <span class="lna-switch-name">${t('settings.lockRatio.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.lockRatio.desc')}</span>
                 </span>
-                <input type="checkbox" class="lna-switch" data-set="lockRatio" ${state.lockRatio ? 'checked' : ''} aria-label="锁定比例">
+                <input type="checkbox" class="lna-switch" data-set="lockRatio" ${state.lockRatio ? 'checked' : ''} aria-label="${t('settings.lockRatio.name')}">
               </label>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">卡片尺寸</span>
-                  <span class="lna-switch-desc">单位 px，范围 ${CARD_SIZE_MIN}–${CARD_SIZE_MAX}。</span>
+                  <span class="lna-switch-name">${t('settings.cardSize.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.cardSize.desc', { min: CARD_SIZE_MIN, max: CARD_SIZE_MAX })}</span>
                 </span>
                 <div class="lna-size-group">
-                  <label class="lna-size-field">宽
-                    <input type="number" class="lna-size-input" data-size="w" min="${CARD_SIZE_MIN}" max="${CARD_SIZE_MAX}" step="1" value="${state.cardWidth}" aria-label="卡片宽度（px）">
+                  <label class="lna-size-field">${t('settings.width')}
+                    <input type="number" class="lna-size-input" data-size="w" min="${CARD_SIZE_MIN}" max="${CARD_SIZE_MAX}" step="1" value="${state.cardWidth}" aria-label="${t('settings.widthAria')}">
                   </label>
-                  <label class="lna-size-field">高
-                    <input type="number" class="lna-size-input" data-size="h" min="${CARD_SIZE_MIN}" max="${CARD_SIZE_MAX}" step="1" value="${state.cardHeight}" aria-label="卡片高度（px）">
+                  <label class="lna-size-field">${t('settings.height')}
+                    <input type="number" class="lna-size-input" data-size="h" min="${CARD_SIZE_MIN}" max="${CARD_SIZE_MAX}" step="1" value="${state.cardHeight}" aria-label="${t('settings.heightAria')}">
                   </label>
                 </div>
               </div>
             </div>
             <div class="lna-set-group">
-              <div class="lna-set-group-title">标签翻译设置</div>
+              <div class="lna-set-group-title">${t('settings.group.translate')}</div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">翻译方案</span>
-                  <span class="lna-switch-desc">混合翻译：先查内置翻译词典，未收录的标签再用 GGUF 模型翻译；仅用翻译词典则不调用模型，未收录的标签显示「未完成翻译」。</span>
+                  <span class="lna-switch-name">${t('settings.mode.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.mode.desc')}</span>
                 </span>
                 ${modeGroupHtml()}
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">llama_cpp 模型</span>
-                  <span class="lna-switch-desc">训练标签优先由所选 GGUF 模型翻译；模型未选择或加载失败时自动回退到内置词典。</span>
+                  <span class="lna-switch-name">${t('settings.llm.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.llm.desc')}</span>
                 </span>
                 <div class="lna-inline-group">
-                  <button class="dlg-btn lna-llm-open-folder" type="button" title="在资源管理器中打开模型所在的文件夹">打开模型文件夹</button>
-                  <select class="lna-llm-select" aria-label="选择用于标签翻译的 GGUF 模型">
-                    <option value="">（不使用 GGUF，仅用词典）</option>
+                  <button class="dlg-btn lna-llm-open-folder" type="button" title="${t('settings.llm.openFolderTitle')}">${t('settings.llm.openFolder')}</button>
+                  <select class="lna-llm-select" aria-label="${t('settings.llm.selectAria')}">
+                    <option value="">${t('settings.llm.none')}</option>
                   </select>
-                  <button class="dlg-btn lna-llm-refresh" type="button" title="重新扫描 models/LLM 目录">刷新</button>
+                  <button class="dlg-btn lna-llm-refresh" type="button" title="${t('settings.llm.refreshTitle')}">${t('settings.llm.refresh')}</button>
                 </div>
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">推理设备</span>
-                  <span class="lna-switch-desc">CPU 不占显存、与出图互不干扰；GPU 翻译更快（约 10 秒内），但模型常驻显存（约 2.5GB），显存不足时会自动降级 CPU。</span>
+                  <span class="lna-switch-name">${t('settings.device.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.device.desc')}</span>
                 </span>
-                <div class="lna-zh-switch lna-device-switch" role="group" aria-label="翻译推理设备">
+                <div class="lna-zh-switch lna-device-switch" role="group" aria-label="${t('settings.device.aria')}">
                   <button class="lna-zh-key active" type="button" data-dev="cpu" aria-pressed="true">CPU</button>
                   <button class="lna-zh-key" type="button" data-dev="gpu" aria-pressed="false">GPU</button>
                 </div>
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">翻译运行环境</span>
-                  <span class="lna-switch-desc">CPU 版随插件离线安装，开箱即可用。需要 GPU 加速时在此下载 CUDA 版（约 490MB）：下载完成后重启 WebUI 会自动安装并生效。CUDA 版自带 CPU 后端，显存不足时仍会回退 CPU。</span>
+                  <span class="lna-switch-name">${t('settings.runtime.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.runtime.desc')}</span>
                 </span>
                 <div class="lna-llm-dl">
                   <div class="lna-llm-dl-row">
-                    <span class="lna-runtime-state" role="status" aria-live="polite">读取中…</span>
+                    <span class="lna-runtime-state" role="status" aria-live="polite">${t('settings.runtime.reading')}</span>
                   </div>
                   <div class="lna-llm-dl-row">
-                    <button class="dlg-btn dlg-action lna-runtime-install" type="button">安装 CUDA 版本，使用 GPU 推理</button>
+                    <button class="dlg-btn dlg-action lna-runtime-install" type="button">${t('settings.runtime.install')}</button>
                   </div>
                   <div class="lna-llm-progress lna-runtime-progress" role="status" aria-live="polite" hidden></div>
                 </div>
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">空闲时自动卸载模型</span>
-                  <span class="lna-switch-desc">翻译完成后超过设定时长无新翻译，自动释放模型占用的显存/内存；下次翻译会重新加载（GPU 需几秒）。范围 ${IDLE_MIN}–${IDLE_MAX} 分钟。</span>
+                  <span class="lna-switch-name">${t('settings.idle.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.idle.desc', { min: IDLE_MIN, max: IDLE_MAX })}</span>
                 </span>
                 <div class="lna-inline-group">
-                  <div class="lna-zh-switch lna-idle-switch" role="group" aria-label="空闲时自动卸载模型">
-                    <button class="lna-zh-key" type="button" data-idle="0" aria-pressed="false">永不卸载模型</button>
-                    <button class="lna-zh-key active" type="button" data-idle="1" aria-pressed="true">计时自动卸载</button>
+                  <div class="lna-zh-switch lna-idle-switch" role="group" aria-label="${t('settings.idle.aria')}">
+                    <button class="lna-zh-key" type="button" data-idle="0" aria-pressed="false">${t('settings.idle.never')}</button>
+                    <button class="lna-zh-key active" type="button" data-idle="1" aria-pressed="true">${t('settings.idle.timed')}</button>
                   </div>
-                  <label class="lna-size-field">空闲
-                    <input type="number" class="lna-size-input lna-idle-minutes" min="${IDLE_MIN}" max="${IDLE_MAX}" step="1" value="${IDLE_DEFAULT}" aria-label="空闲卸载时长（分钟）">
+                  <label class="lna-size-field">${t('settings.idle.label')}
+                    <input type="number" class="lna-size-input lna-idle-minutes" min="${IDLE_MIN}" max="${IDLE_MAX}" step="1" value="${IDLE_DEFAULT}" aria-label="${t('settings.idle.minutesAria')}">
                   </label>
-                  <span class="lna-idle-unit">分钟</span>
+                  <span class="lna-idle-unit">${t('settings.idle.unit')}</span>
                 </div>
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">下载 GGUF 模型</span>
-                  <span class="lna-switch-desc">可填 HF 仓库 ID 或链接。会自动探测网络：官方站优先，超时或失败则改用 hf-mirror 镜像。</span>
+                  <span class="lna-switch-name">${t('settings.download.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.download.desc')}</span>
                 </span>
                 <div class="lna-llm-dl">
                   <div class="lna-llm-dl-row">
-                    <input type="text" class="lna-cf-input lna-llm-repo" value="${LLM_PRESET_REPO}" aria-label="模型下载仓库或链接" spellcheck="false">
-                    <button class="dlg-btn dlg-action lna-llm-detect" type="button" title="读取该仓库中可用的 GGUF 文件">检测</button>
+                    <input type="text" class="lna-cf-input lna-llm-repo" value="${LLM_PRESET_REPO}" aria-label="${t('settings.download.repoAria')}" spellcheck="false">
+                    <button class="dlg-btn dlg-action lna-llm-detect" type="button" title="${t('settings.download.detectTitle')}">${t('settings.download.detect')}</button>
                   </div>
                   <div class="lna-llm-dl-row">
-                    <select class="lna-llm-file" aria-label="选择要下载的 GGUF 文件">
-                      <option value="">— 点「检测」读取可选文件 —</option>
+                    <select class="lna-llm-file" aria-label="${t('settings.download.fileAria')}">
+                      <option value="">${t('settings.download.placeholder')}</option>
                     </select>
-                    <button class="dlg-btn primary lna-llm-download" type="button" title="下载所选模型到 LLM 目录">下载</button>
+                    <button class="dlg-btn primary lna-llm-download" type="button" title="${t('settings.download.downloadTitle')}">${t('settings.download.download')}</button>
                   </div>
                   <div class="lna-llm-progress" role="status" aria-live="polite" hidden></div>
                 </div>
               </div>
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">翻译提示预设</span>
-                  <span class="lna-switch-desc">模型翻译使用的提示词。切换下拉框立即生效；「默认」为内置内容，不可覆盖或删除。</span>
+                  <span class="lna-switch-name">${t('settings.prompt.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.prompt.desc')}</span>
                 </span>
                 <div class="lna-inline-group">
-                  <select class="lna-prompt-select" aria-label="选择翻译提示预设"></select>
-                  <button class="dlg-btn lna-prompt-delete" type="button" title="删除当前选中的预设">删除预设</button>
+                  <select class="lna-prompt-select" aria-label="${t('settings.prompt.selectAria')}"></select>
+                  <button class="dlg-btn lna-prompt-delete" type="button" title="${t('settings.prompt.deleteTitle')}">${t('settings.prompt.delete')}</button>
                 </div>
               </div>
               <div class="lna-switch-row lna-no-sep">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-name">预设名称</span>
-                  <span class="lna-switch-desc">保存时使用的预设名。与已有预设同名则覆盖，最长 ${PROMPT_NAME_MAX} 个字符。</span>
+                  <span class="lna-switch-name">${t('settings.promptName.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.promptName.desc', { max: PROMPT_NAME_MAX })}</span>
                 </span>
                 <div class="lna-inline-group">
-                  <input type="text" class="lna-cf-input lna-prompt-name" maxlength="${PROMPT_NAME_MAX}" placeholder="例如：更口语化的译法" aria-label="预设名称" spellcheck="false">
-                  <button class="dlg-btn primary lna-prompt-save" type="button" title="保存当前提示文本为新预设">保存预设</button>
+                  <input type="text" class="lna-cf-input lna-prompt-name" maxlength="${PROMPT_NAME_MAX}" placeholder="${t('settings.promptName.placeholder')}" aria-label="${t('settings.promptName.aria')}" spellcheck="false">
+                  <button class="dlg-btn primary lna-prompt-save" type="button" title="${t('settings.promptName.saveTitle')}">${t('settings.promptName.save')}</button>
                 </div>
               </div>
               <div class="lna-prompt-editor">
                 <div class="lna-prompt-editor-head">
-                  <span class="lna-switch-name">预设提示文本</span>
-                  <span class="lna-switch-desc">必须包含 <code>{tags}</code> 占位符，翻译时会被替换为待翻译的标签列表。</span>
+                  <span class="lna-switch-name">${t('settings.promptText.name')}</span>
+                  <span class="lna-switch-desc">${t('settings.promptText.desc')}</span>
                 </div>
-                <textarea class="lna-cf-input lna-prompt-text" rows="7" spellcheck="false" aria-label="预设提示文本"></textarea>
+                <textarea class="lna-cf-input lna-prompt-text" rows="7" spellcheck="false" aria-label="${t('settings.promptText.aria')}"></textarea>
                 <div class="lna-prompt-msg" role="status" aria-live="polite" hidden></div>
               </div>
             </div>
             <div class="lna-set-group">
-              <div class="lna-set-group-title">自动匹配旧数据</div>
+              <div class="lna-set-group-title">${t('settings.group.oldData')}</div>
               <div class="lna-switch-row lna-no-sep">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-desc">模型在 LoRA 目录中被移动或改名后，其卡片资料（描述、触发词、标签译文等）会因路径变化而失联。点击按钮后，优先按 哈希值 匹配（哈希≈模型的身份证），无哈希时按 文件名+文件大小 匹配，把旧资料迁移到模型当前位置，并同步使用次数等统计；无法匹配的旧资料列入下方列表，便于手动清理。</span>
+                  <span class="lna-switch-desc">${t('settings.oldData.desc')}</span>
                 </span>
-                <button class="dlg-btn primary lna-match-run" type="button">扫描并迁移失联的卡片资料</button>
+                <button class="dlg-btn primary lna-match-run" type="button">${t('settings.oldData.run')}</button>
               </div>
               <div class="lna-match-progress lna-llm-progress" role="status" aria-live="polite" hidden></div>
               <div class="lna-match-result" hidden>
-                <div class="lna-match-result-title">未能成功匹配<span class="lna-match-result-count"></span></div>
-                <div class="lna-match-result-desc">以下旧资料在 LoRA 目录中找不到对应的模型文件（可能已被删除或重命名），确认无用后可在 models_json_data 目录中手动清理。</div>
-                <ul class="lna-match-unmatched" aria-label="未能成功匹配的旧数据列表"></ul>
+                <div class="lna-match-result-title">${t('settings.oldData.unmatchedTitle')}<span class="lna-match-result-count"></span></div>
+                <div class="lna-match-result-desc">${t('settings.oldData.unmatchedDesc')}</div>
+                <ul class="lna-match-unmatched" aria-label="${t('settings.oldData.unmatchedAria')}"></ul>
               </div>
               <div class="lna-switch-row lna-sep-top">
                 <span class="lna-switch-text">
-                  <span class="lna-switch-desc">读取 models/Lora 目录中旧插件 sd_forge_lora 生成的同名 JSON（与模型文件同目录、同名），把里面的描述、基础模型、触发词、推荐权重、反向提示词、注意事项同步到本插件的卡片资料。旧 JSON 不会被删除；新旧 JSON 都有内容时不会自动覆盖，而是列在下方由你决定是否覆盖。</span>
+                  <span class="lna-switch-desc">${t('settings.sync.desc')}</span>
                 </span>
-                <button class="dlg-btn primary lna-sync-run" type="button">同步Lora的json到本插件</button>
+                <button class="dlg-btn primary lna-sync-run" type="button">${t('settings.sync.run')}</button>
               </div>
               <div class="lna-sync-progress lna-llm-progress" role="status" aria-live="polite" hidden></div>
               <div class="lna-sync-conflicts" hidden>
-                <div class="lna-sync-conflicts-title">检测到冲突<span class="lna-sync-conflicts-count"></span></div>
-                <div class="lna-sync-conflicts-desc">这些模型的新旧 JSON 都已有内容，自动同步已跳过。点击「覆盖」会用旧 JSON 的资料覆盖本插件对应字段（训练标签与译文不受影响）。</div>
-                <ul class="lna-sync-list" aria-label="新旧 JSON 冲突列表"></ul>
+                <div class="lna-sync-conflicts-title">${t('settings.sync.conflictsTitle')}<span class="lna-sync-conflicts-count"></span></div>
+                <div class="lna-sync-conflicts-desc">${t('settings.sync.conflictsDesc')}</div>
+                <ul class="lna-sync-list" aria-label="${t('settings.sync.conflictsAria')}"></ul>
               </div>
             </div>`,
-          footerHtml: `<button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>`,
+          footerHtml: `<button class="dlg-btn dlg-cancel" data-act="close" type="button">${t('settings.close')}</button>`,
           onOpen(modal) {
             modal.querySelector('[data-act="close"]').addEventListener('click', () => closeModal(modal));
+
+            // 界面语言下拉：切换后关闭并重开设置弹窗，让弹窗内文案同步刷新
+            const langSel = modal.querySelector('.lna-lang-select');
+            if (langSel) {
+              langSel.addEventListener('change', async () => {
+                const ok = await switchLang(langSel.value);
+                if (!ok) return;
+                closeModal(modal);
+                const rootNow = getActiveRoot();
+                const btn = rootNow && rootNow.querySelector('.lna-settings');
+                if (btn) btn.click();
+              });
+            }
 
             const wInp = modal.querySelector('.lna-size-input[data-size="w"]');
             const hInp = modal.querySelector('.lna-size-input[data-size="h"]');
@@ -1211,14 +1347,14 @@
               const raw = parseFloat(sbInp ? sbInp.value : NaN);
               if (!isFinite(raw)) {
                 if (sbInp) sbInp.value = state.sidebarWidth; // 输入非法则还原
-                flashToast('请输入有效的宽度数值');
+                flashToast(t('toast.invalidWidth'));
                 return;
               }
               state.sidebarWidth = clampSidebarWidth(raw);
               saveSettings();
               applyLayoutVars();
               if (sbInp) sbInp.value = state.sidebarWidth;
-              flashToast(`已保存：菜单宽度 ${state.sidebarWidth} px`);
+              flashToast(t('toast.savedSidebar', { v: state.sidebarWidth }));
             }
             if (sbSave) sbSave.addEventListener('click', saveSidebarWidth);
             if (sbInp) {
@@ -1234,14 +1370,14 @@
               const raw = parseFloat(bhInp ? bhInp.value : NaN);
               if (!isFinite(raw)) {
                 if (bhInp) bhInp.value = state.bodyHeight; // 输入非法则还原
-                flashToast('请输入有效的高度数值');
+                flashToast(t('toast.invalidHeight'));
                 return;
               }
               state.bodyHeight = clampBodyHeight(raw);
               saveSettings();
               applyLayoutVars();
               if (bhInp) bhInp.value = state.bodyHeight;
-              flashToast(`已保存：内容区高度 ${state.bodyHeight} px`);
+              flashToast(t('toast.savedBodyH', { v: state.bodyHeight }));
             }
             if (bhSave) bhSave.addEventListener('click', saveBodyHeight);
             if (bhInp) {
@@ -1257,7 +1393,7 @@
                 if (!parts[0]) return;
                 state.cardHeight = clampCardSize(state.cardWidth * parts[1] / parts[0]);
                 commit();
-                flashToast(`已应用比例 ${b.dataset.ratio}`);
+                flashToast(t('toast.appliedRatio', { ratio: b.dataset.ratio }));
               });
             });
 
@@ -1284,7 +1420,7 @@
                   applySearch();
                 }
                 // lockRatio 只影响后续输入联动，不改变当前视图
-                flashToast(sw.checked ? '已开启：' + sw.getAttribute('aria-label') : '已关闭：' + sw.getAttribute('aria-label'));
+                flashToast(sw.checked ? t('toast.switchOn', { name: sw.getAttribute('aria-label') }) : t('toast.switchOff', { name: sw.getAttribute('aria-label') }));
               });
             });
 
@@ -1310,7 +1446,7 @@
     if (!btn) return;
     btn.classList.toggle('is-loaded', !!loaded);
     btn.disabled = !loaded; // 未加载时纯展示，不可点击
-    btn.setAttribute('aria-label', loaded ? '翻译模型已加载，点击可卸载' : '翻译模型未加载');
+    btn.setAttribute('aria-label', loaded ? t('llmState.loadedAria') : t('llmState.offAria'));
   }
 
   async function refreshLlmState() {
@@ -1340,13 +1476,13 @@
         if (j && j.ok) {
           // 后端返回最新状态（已卸载时 unloaded=false，幂等不报错）
           document.querySelectorAll('.lna-root').forEach((el) => paintLlmState(el, !!j.loaded));
-          flashToast(j.unloaded ? '已卸载翻译模型，释放显存/内存' : '翻译模型本就未加载');
+          flashToast(j.unloaded ? t('llmState.unloaded') : t('llmState.wasUnloaded'));
         } else {
-          flashToast('卸载失败：' + ((j && j.error) || '未知错误'), true);
+          flashToast(t('llmState.unloadFailed', { msg: (j && j.error) || t('toast.unknownError') }), true);
           refreshLlmState();
         }
       } catch (e) {
-        flashToast('卸载失败：请求出错', true);
+        flashToast(t('llmState.unloadReqFailed'), true);
         refreshLlmState();
       }
     });
@@ -1374,7 +1510,7 @@
     sel.innerHTML = '';
     const none = document.createElement('option');
     none.value = '';
-    none.textContent = engineReady ? '（不使用 GGUF，仅用词典）' : '（llama_cpp 未安装，仅用词典）';
+    none.textContent = engineReady ? t('settings.llm.none') : t('llm.noneNoEngine');
     sel.appendChild(none);
     models.forEach((m) => {
       const o = document.createElement('option');
@@ -1392,7 +1528,7 @@
       const res = await r.json();
       if (!document.contains(modal)) return null;
       if (!res || !res.ok) {
-        setLlmProgress(modal, (res && res.error) || '读取模型列表失败', true);
+        setLlmProgress(modal, (res && res.error) || t('llm.readModelsFailed'), true);
         return null;
       }
       fillLlmOptions(modal, res.models || [], res.selected || '', res.engine_ready);
@@ -1401,14 +1537,14 @@
         // 带上后端返回的真实原因：多数情况是 CUDA 运行库不在启动环境里
         setLlmProgress(
           modal,
-          '未检测到可用的 llama_cpp 模块，标签翻译将只使用内置词典。'
-            + (res.engine_error ? '原因：' + res.engine_error : ''),
+          t('llm.engineMissing')
+            + (res.engine_error ? t('llm.engineReason', { msg: res.engine_error }) : ''),
           true,
         );
       }
       return res;
     } catch (e) {
-      setLlmProgress(modal, '读取模型列表失败：请求出错', true);
+      setLlmProgress(modal, t('llm.readModelsFailedReq'), true);
       return null;
     }
   }
@@ -1424,7 +1560,7 @@
       k.setAttribute('aria-pressed', on ? 'true' : 'false');
       if (isGpu) {
         k.disabled = !cudaAvailable;
-        k.title = cudaAvailable ? 'GPU 推理（快，占显存）' : '当前为 CPU 构建，需安装 CUDA 版 llama-cpp-python';
+        k.title = cudaAvailable ? t('llm.gpuTitle') : t('llm.gpuDisabledTitle');
       }
     });
   }
@@ -1464,12 +1600,12 @@
 
   // 翻译方案控件 HTML：插件设置与卡片设置共用同一套按钮结构
   function modeGroupHtml() {
-    return `<div class="lna-mode-group" role="group" aria-label="标签翻译方案">${TRANS_MODES.map((x) => `<button class="lna-mode-btn${x.v === TRANS_MODE_DEFAULT ? ' active' : ''}" type="button" data-mode="${x.v}" aria-pressed="${x.v === TRANS_MODE_DEFAULT ? 'true' : 'false'}">${x.label}</button>`).join('')}</div>`;
+    return `<div class="lna-mode-group" role="group" aria-label="${t('settings.mode.groupAria')}">${TRANS_MODES.map((x) => `<button class="lna-mode-btn${x.v === TRANS_MODE_DEFAULT ? ' active' : ''}" type="button" data-mode="${x.v}" aria-pressed="${x.v === TRANS_MODE_DEFAULT ? 'true' : 'false'}">${t('settings.mode.' + x.v)}</button>`).join('')}</div>`;
   }
 
   function modeLabel(mode) {
     const hit = TRANS_MODES.find((x) => x.v === mode);
-    return hit ? hit.label : String(mode || '');
+    return hit ? t('settings.mode.' + hit.v) : String(mode || '');
   }
 
   // 绑定翻译方案按钮：写入后端后同步「文档内所有」方案控件，
@@ -1488,13 +1624,13 @@
           const res = await r.json();
           if (res && res.ok) {
             syncModeSwitch(document, res.mode);
-            flashToast('已切换为「' + modeLabel(res.mode) + '」');
+            flashToast(t('toast.modeSwitched', { mode: modeLabel(res.mode) }));
           } else {
-            flashToast('保存失败：' + ((res && res.error) || '未知错误'), true);
+            flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
             await refreshTranslateMode(root); // 回滚为后端真实值
           }
         } catch (e) {
-          flashToast('保存失败：请求出错', true);
+          flashToast(t('toast.saveFailed', { msg: t('toast.unknownError') }), true);
           await refreshTranslateMode(root);
         }
       });
@@ -1545,7 +1681,7 @@
     const presets = (data && data.presets) || [];
 
     sel.innerHTML = presets
-      .map((p) => `<option value="${esc(p.name)}">${esc(p.name === defName ? p.name + '（内置）' : p.name)}</option>`)
+      .map((p) => `<option value="${esc(p.name)}">${esc(p.name === defName ? t('llm.promptBuiltinOption', { name: p.name }) : p.name)}</option>`)
       .join('');
     sel.value = active;
 
@@ -1554,7 +1690,7 @@
     nameInp.value = active === defName ? '' : active; // 默认预设不可覆盖，名称留空待填
     if (delBtn) {
       delBtn.disabled = active === defName; // 内置预设不可删除
-      delBtn.title = delBtn.disabled ? '「默认」预设为内置内容，不可删除' : '删除当前选中的预设';
+      delBtn.title = delBtn.disabled ? t('llm.promptDefaultLockedTitle') : t('settings.prompt.deleteTitle');
     }
   }
 
@@ -1580,10 +1716,10 @@
         syncPromptUI(modal, res);
         return res;
       }
-      setPromptMsg(modal, (res && res.error) || '操作失败', true);
+      setPromptMsg(modal, (res && res.error) || t('llm.opFailed'), true);
       return null;
     } catch (e) {
-      setPromptMsg(modal, '操作失败：请求出错', true);
+      setPromptMsg(modal, t('llm.opFailedReq'), true);
       return null;
     }
   }
@@ -1602,7 +1738,7 @@
     sel.addEventListener('change', async () => {
       setPromptMsg(modal, '');
       const res = await editPromptPresets(modal, { action: 'select', name: sel.value });
-      if (res) flashToast('已启用提示预设「' + res.active + '」');
+      if (res) flashToast(t('llm.promptActivated', { name: res.active }));
     });
 
     // 保存：以输入框中的名称写入当前文本（同名覆盖）
@@ -1610,14 +1746,14 @@
       setPromptMsg(modal, '');
       const name = (nameInp.value || '').trim();
       const res = await editPromptPresets(modal, { action: 'save', name, text: textArea.value });
-      if (res) flashToast('已保存提示预设「' + name + '」并启用');
+      if (res) flashToast(t('llm.promptSaved', { name }));
     });
 
     // 删除当前选中的预设
     delBtn.addEventListener('click', async () => {
       setPromptMsg(modal, '');
       const res = await editPromptPresets(modal, { action: 'delete', name: sel.value });
-      if (res) flashToast('已删除提示预设，当前启用「' + res.active + '」');
+      if (res) flashToast(t('llm.promptDeleted', { name: res.active }));
     });
   }
 
@@ -1636,7 +1772,7 @@
     if (!files.length) {
       const o = document.createElement('option');
       o.value = '';
-      o.textContent = '— 该仓库没有 GGUF 文件 —';
+      o.textContent = t('llm.repoNoFiles');
       sel.appendChild(o);
       return;
     }
@@ -1644,7 +1780,7 @@
       const o = document.createElement('option');
       o.value = f.filename;
       // 带 mmproj 的是多模态投影文件，不是主模型，额外标注以免误选
-      const tag = /mmproj/i.test(f.filename) ? '（多模态投影，非主模型）' : '';
+      const tag = /mmproj/i.test(f.filename) ? t('llm.mmprojTag') : '';
       o.textContent = `${f.filename}${tag}${f.size ? ' · ' + fmtSize(f.size) : ''}`;
       sel.appendChild(o);
     });
@@ -1673,27 +1809,27 @@
     } catch (e) { info = null; }
     if (!document.contains(modal)) return null;
     if (!info || !info.ok) {
-      state.textContent = '读取运行环境失败';
+      state.textContent = t('llm.runtimeReadFailed');
       btn.disabled = true;
       return null;
     }
     let text = '';
     let canDownload = false;
     if (info.build === 'cuda') {
-      text = info.usable ? '已是 CUDA 版：GPU 优先，显存不足时自动改用 CPU' : 'CUDA 版已安装，但无法加载';
+      text = info.usable ? t('llm.runtimeCudaOk') : t('llm.runtimeCudaNoLoad');
     } else if (info.cuda_wheel_ready) {
-      text = 'CUDA 版已下载，重启 WebUI 后自动安装并生效';
+      text = t('llm.runtimeWheelReady');
     } else if (!info.nvidia_ok) {
       text = info.driver
-        ? `当前为 CPU 版（NVIDIA 驱动 ${info.driver} 低于 ${info.min_driver}，无法使用 GPU）`
-        : '当前为 CPU 版（未检测到 NVIDIA 显卡）';
+        ? t('llm.runtimeCpuOldDriver', { driver: info.driver, min: info.min_driver })
+        : t('llm.runtimeCpuNoNvidia');
     } else {
-      text = '当前为 CPU 版（可下载 CUDA 版以启用 GPU 推理）';
+      text = t('llm.runtimeCpuDownloadable');
       canDownload = true;
     }
     state.textContent = text;
     btn.disabled = !canDownload;
-    btn.title = canDownload ? '下载约 490MB 的 CUDA 版轮子；下载完成后重启 WebUI 自动安装' : '';
+    btn.title = canDownload ? t('llm.runtimeDownloadTitle') : '';
     return info;
   }
 
@@ -1719,17 +1855,17 @@
         if (!st || !st.ok) return;
         if (st.active) {
           const pct = st.total ? ((st.done / st.total) * 100).toFixed(1) : '?';
-          const retry = st.attempt > 1 ? ` · 第 ${st.attempt} 次续传` : '';
+          const retry = st.attempt > 1 ? t('llm.retrySuffix', { n: st.attempt }) : '';
           setRuntimeProgress(modal,
-            `正在下载 CUDA 版：${fmtSize(st.done)}${st.total ? ' / ' + fmtSize(st.total) : ''}（${pct}%）${retry}`);
+            t('llm.runtimeDownloading', { done: fmtSize(st.done), total: st.total ? ' / ' + fmtSize(st.total) : '', pct, retry }));
           return;
         }
         stopPoll();
         if (st.cuda_wheel_ready) {
-          setRuntimeProgress(modal, 'CUDA 版已下载完成，请重启 WebUI：启动时会自动安装并生效');
-          flashToast('CUDA 版下载完成，重启 WebUI 后生效');
+          setRuntimeProgress(modal, t('llm.runtimeDownloaded'));
+          flashToast(t('llm.runtimeDoneToast'));
         } else {
-          setRuntimeProgress(modal, st.error || '下载未完成', true);
+          setRuntimeProgress(modal, st.error || t('llm.downloadIncomplete'), true);
         }
         refreshRuntimeInfo(modal);
       }, 1000);
@@ -1746,17 +1882,17 @@
     })();
 
     btn.addEventListener('click', async () => {
-      setRuntimeProgress(modal, '正在准备下载…');
+      setRuntimeProgress(modal, t('llm.preparingDownload'));
       try {
         const r = await fetch(API.runtimeDownloadCuda, { method: 'POST' });
         const res = await r.json();
         if (!res || !res.ok) {
-          setRuntimeProgress(modal, (res && res.error) || '下载启动失败', true);
+          setRuntimeProgress(modal, (res && res.error) || t('llm.downloadStartFailed'), true);
           refreshRuntimeInfo(modal);
           return;
         }
       } catch (e) {
-        setRuntimeProgress(modal, '下载启动失败：请求出错', true);
+        setRuntimeProgress(modal, t('llm.downloadStartFailedReq'), true);
         return;
       }
       startPoll();
@@ -1795,10 +1931,10 @@
 
     refresh.addEventListener('click', async () => {
       refresh.disabled = true;
-      setLlmProgress(modal, '正在重新扫描模型目录…');
+      setLlmProgress(modal, t('llm.rescanning'));
       const res = await refreshLlmModels(modal);
       refresh.disabled = false;
-      if (res) setLlmProgress(modal, `已扫描到 ${(res.models || []).length} 个 GGUF 模型`);
+      if (res) setLlmProgress(modal, t('llm.scannedModels', { n: (res.models || []).length }));
     });
 
     // 打开模型文件夹：后端调系统资源管理器打开 LLM 目录
@@ -1807,9 +1943,9 @@
         try {
           const r = await fetch(API.llmOpenFolder, { method: 'POST' });
           const res = await r.json();
-          if (!res || !res.ok) flashToast('打开失败：' + ((res && res.error) || '未知错误'));
+          if (!res || !res.ok) flashToast(t('toast.openFailed', { msg: (res && res.error) || t('toast.unknownError') }));
         } catch (e) {
-          flashToast('打开失败：请求出错');
+          flashToast(t('toast.openFailedReq'));
         }
       });
     }
@@ -1828,12 +1964,12 @@
           const res = await r.json();
           if (res && res.ok) {
             syncDeviceSwitch(modal, want, true);
-            flashToast(want ? '已切换 GPU 推理（下次翻译时加载进显存）' : '已切换 CPU 推理');
+            flashToast(want ? t('llm.switchedGpu') : t('llm.switchedCpu'));
           } else {
-            flashToast((res && res.error) || '切换失败');
+            flashToast((res && res.error) || t('llm.switchFailed'));
           }
         } catch (e) {
-          flashToast('切换失败：请求出错');
+          flashToast(t('llm.switchFailedReq'));
         }
       });
     });
@@ -1855,11 +1991,11 @@
           syncIdleSwitch(modal, res.auto_unload, res.idle_minutes);
           if (okMsg) flashToast(okMsg);
         } else {
-          flashToast('保存失败：' + ((res && res.error) || '未知错误'), true);
+          flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
           await refreshLlmIdle(modal); // 回滚为后端真实值
         }
       } catch (e) {
-        flashToast('保存失败：请求出错', true);
+        flashToast(t('toast.saveFailedReq'), true);
         await refreshLlmIdle(modal);
       }
     }
@@ -1869,7 +2005,7 @@
         const want = k.dataset.idle === '1';
         const minutes = clampIdleMinutes(idleInp ? idleInp.value : IDLE_DEFAULT);
         saveIdle({ auto_unload: want, minutes },
-          want ? `已开启：空闲 ${minutes} 分钟后自动卸载` : '已关闭：模型将一直保留到手动卸载');
+          want ? t('llm.idleOn', { n: minutes }) : t('llm.idleOff'));
       });
     });
     if (idleInp) {
@@ -1877,7 +2013,7 @@
       const commitIdle = () => {
         const v = clampIdleMinutes(idleInp.value);
         idleInp.value = String(v);
-        saveIdle({ minutes: v }, `已保存：空闲 ${v} 分钟后自动卸载`);
+        saveIdle({ minutes: v }, t('llm.idleSaved', { n: v }));
       };
       idleInp.addEventListener('change', commitIdle);
       idleInp.addEventListener('keydown', (e) => {
@@ -1895,23 +2031,23 @@
         });
         const res = await r.json();
         if (res && res.ok) {
-          flashToast(sel.value ? '已选择模型：' + sel.value : '已切换为仅用词典');
+          flashToast(sel.value ? t('llm.modelSelected', { name: sel.value }) : t('llm.switchedToDict'));
           setLlmProgress(modal, sel.value
-            ? '模型将在下次翻译标签时自动加载（首次加载需要几秒）。'
+            ? t('llm.modelLoadNote')
             : '');
         } else {
-          flashToast('保存失败：' + ((res && res.error) || '未知错误'));
+          flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }));
         }
       } catch (e) {
-        flashToast('保存失败：请求出错');
+        flashToast(t('toast.saveFailedReq'));
       }
     });
 
     async function detectRepo(showToast) {
       const repo = (repoInput.value || '').trim();
-      if (!repo) { setLlmProgress(modal, '请先填写 HF 仓库或链接', true); return []; }
+      if (!repo) { setLlmProgress(modal, t('llm.needRepo'), true); return []; }
       detectBtn.disabled = true;
-      setLlmProgress(modal, '正在探测网络并读取仓库文件列表…');
+      setLlmProgress(modal, t('llm.probingRepo'));
       try {
         const r = await fetch(API.llmRepoFiles, {
           method: 'POST',
@@ -1921,15 +2057,15 @@
         const res = await r.json();
         if (!document.contains(modal)) return [];
         if (!res || !res.ok) {
-          setLlmProgress(modal, (res && res.error) || '读取失败', true);
+          setLlmProgress(modal, (res && res.error) || t('llm.readFailed'), true);
           return [];
         }
         fillLlmFiles(modal, res.files || []);
-        setLlmProgress(modal, `已找到 ${res.files.length} 个文件 · 下载源：${res.endpoint} · 保存到 ${res.dir}`);
-        if (showToast) flashToast(`检测到 ${res.files.length} 个可下载文件`);
+        setLlmProgress(modal, t('llm.filesFound', { n: res.files.length, endpoint: res.endpoint, dir: res.dir }));
+        if (showToast) flashToast(t('llm.filesDetected', { n: res.files.length }));
         return res.files || [];
       } catch (e) {
-        setLlmProgress(modal, '读取失败：请求出错', true);
+        setLlmProgress(modal, t('llm.readFailedReq'), true);
         return [];
       } finally {
         detectBtn.disabled = false;
@@ -1953,15 +2089,15 @@
           const { active, done, total, error, ok, filename, endpoint, attempt } = res;
           if (active) {
             const pct = total > 0 ? ((done / total) * 100).toFixed(1) : '?';
-            const retry = attempt > 1 ? ` · 第 ${attempt} 次续传` : '';
-            setLlmProgress(modal, `正在下载 ${filename}：${fmtSize(done)}${total ? ' / ' + fmtSize(total) : ''}（${pct}%）· 源：${endpoint}${retry}`);
+            const retry = attempt > 1 ? t('llm.retrySuffix', { n: attempt }) : '';
+            setLlmProgress(modal, t('llm.downloading', { file: filename, done: fmtSize(done), total: total ? ' / ' + fmtSize(total) : '', pct, endpoint, retry }));
             return;
           }
           stopPoll();
           dlBtn.disabled = false;
           if (ok) {
-            setLlmProgress(modal, `下载完成：${filename}。已加入模型列表。`);
-            flashToast('模型下载完成');
+            setLlmProgress(modal, t('llm.downloadDone', { file: filename }));
+            flashToast(t('llm.downloadDoneToast'));
             const res2 = await refreshLlmModels(modal);
             // 只有一个模型时自动选中，省去手动操作
             if (res2 && (res2.models || []).length === 1) {
@@ -1988,9 +2124,9 @@
         if (!files.length) return;
       }
       const filename = fileSel.value;
-      if (!filename) { setLlmProgress(modal, '请先选择要下载的文件', true); return; }
+      if (!filename) { setLlmProgress(modal, t('llm.needFile'), true); return; }
       dlBtn.disabled = true;
-      setLlmProgress(modal, `准备下载 ${filename}…`);
+      setLlmProgress(modal, t('llm.preparingFile', { file: filename }));
       try {
         const r = await fetch(API.llmDownload, {
           method: 'POST',
@@ -2000,13 +2136,13 @@
         const res = await r.json();
         if (!res || !res.ok) {
           dlBtn.disabled = false;
-          setLlmProgress(modal, (res && res.error) || '启动下载失败', true);
+          setLlmProgress(modal, (res && res.error) || t('llm.downloadStartFailed'), true);
           return;
         }
         startPoll();
       } catch (e) {
         dlBtn.disabled = false;
-        setLlmProgress(modal, '启动下载失败：请求出错', true);
+        setLlmProgress(modal, t('llm.downloadStartFailedReq'), true);
       }
     });
   }
@@ -2026,13 +2162,13 @@
     const list = (res && res.unmatched) || [];
     const countEl = wrap.querySelector('.lna-match-result-count');
     const ul = wrap.querySelector('.lna-match-unmatched');
-    if (countEl) countEl.textContent = list.length ? `（${list.length} 项）` : '（无）';
+    if (countEl) countEl.textContent = list.length ? t('sync.itemsCount', { n: list.length }) : t('sync.none');
     if (ul) {
       ul.innerHTML = list.map((it) => {
         const bits = [];
-        if (it.hash) bits.push('哈希 ' + esc(it.hash));
-        if (it.size) bits.push('大小 ' + fmtSize(it.size));
-        bits.push(it.has_content ? '含已填资料' : '空资料');
+        if (it.hash) bits.push(t('sync.hashPrefix', { v: it.hash }));
+        if (it.size) bits.push(t('sync.sizePrefix', { v: fmtSize(it.size) }));
+        bits.push(it.has_content ? t('sync.hasContent') : t('sync.emptyData'));
         return `<li class="lna-match-item${it.has_content ? ' has-data' : ''}">
             <span class="lna-match-item-path" title="${esc(it.rel)}">${esc(it.rel)}</span>
             <span class="lna-match-item-meta">${esc(bits.join(' · '))}</span>
@@ -2052,8 +2188,8 @@
       btn.disabled = true;
       btn.setAttribute('aria-busy', 'true');
       const origText = btn.textContent;
-      btn.innerHTML = '<span class="lna-spinner"></span>正在匹配…';
-      setMatchProgress(modal, '正在扫描 LoRA 目录与旧资料…');
+      btn.innerHTML = '<span class="lna-spinner"></span>' + t('sync.matching');
+      setMatchProgress(modal, t('sync.scanningOld'));
       let res = null;
       try {
         const r = await fetch(API.matchOldData, { method: 'POST' });
@@ -2067,19 +2203,19 @@
       btn.removeAttribute('aria-busy');
       btn.textContent = origText;
       if (!res || !res.ok) {
-        setMatchProgress(modal, (res && res.error) || '匹配失败：请求出错', true);
+        setMatchProgress(modal, (res && res.error) || t('sync.matchFailedReq'), true);
         return;
       }
       const parts = [];
-      if (res.matched) parts.push(`成功匹配 ${res.matched} 项`);
-      if (res.moved) parts.push(`迁移 ${res.moved} 项`);
-      if (res.merged) parts.push(`合并 ${res.merged} 项`);
-      if (res.legacy_moved) parts.push(`补录旧版 ${res.legacy_moved} 项`);
+      if (res.matched) parts.push(t('sync.matchedCount', { n: res.matched }));
+      if (res.moved) parts.push(t('sync.movedCount', { n: res.moved }));
+      if (res.merged) parts.push(t('sync.mergedCount', { n: res.merged }));
+      if (res.legacy_moved) parts.push(t('sync.legacyMovedCount', { n: res.legacy_moved }));
       const un = (res.unmatched || []).length;
       if (!res.matched) {
-        setMatchProgress(modal, un ? `未发现可迁移的旧资料，${un} 项未能匹配` : '未发现需要迁移的旧资料', un > 0);
+        setMatchProgress(modal, un ? t('sync.noMigratable', { n: un }) : t('sync.noneToMigrate'), un > 0);
       } else {
-        setMatchProgress(modal, `${parts.join('，')}；${un} 项未能匹配`, un > 0);
+        setMatchProgress(modal, t('sync.matchSummary', { parts: parts.join(t('sync.listSep')), n: un }), un > 0);
       }
       renderMatchResult(modal, res);
       if (res.matched) {
@@ -2089,7 +2225,7 @@
           await loadDir(state.currentPath);
           renderFull(getActiveRoot());
         } catch (e) { /* 刷新失败不影响匹配结果展示 */ }
-        flashToast(`已迁移 ${res.matched} 项旧资料`);
+        flashToast(t('sync.migratedToast', { n: res.matched }));
       }
     });
   }
@@ -2110,7 +2246,7 @@
     const countEl = modal.querySelector('.lna-sync-conflicts-count');
     if (!wrap || !ul) return;
     const items = list || [];
-    if (countEl) countEl.textContent = `（${items.length} 项）`;
+    if (countEl) countEl.textContent = t('sync.itemsCount', { n: items.length });
     ul.innerHTML = items.map((it) => {
       // 差异字段标签：不同=黄橙、一边为空=红；一致的字段不显示
       const tags = (it.fields || [])
@@ -2120,11 +2256,11 @@
         <li class="lna-sync-item" data-rel="${esc(it.rel)}">
           <div class="lna-sync-main">
             <span class="lna-sync-name" title="${esc(it.rel)}">${esc(it.name)}</span>
-            ${tags ? `<div class="lna-sync-tags" aria-label="存在差异的字段">${tags}</div>` : ''}
+            ${tags ? `<div class="lna-sync-tags" aria-label="${esc(t('sync.diffFieldsAria'))}">${tags}</div>` : ''}
           </div>
           <div class="lna-sync-actions">
-            <button class="dlg-btn lna-sync-compare" type="button" data-rel="${esc(it.rel)}" data-name="${esc(it.name)}">查看数据对比</button>
-            <button class="dlg-btn lna-sync-overwrite" type="button" data-rel="${esc(it.rel)}">覆盖</button>
+            <button class="dlg-btn lna-sync-compare" type="button" data-rel="${esc(it.rel)}" data-name="${esc(it.name)}">${t('sync.compare')}</button>
+            <button class="dlg-btn lna-sync-overwrite" type="button" data-rel="${esc(it.rel)}">${t('sync.overwrite')}</button>
           </div>
         </li>`;
     }).join('');
@@ -2134,9 +2270,9 @@
   // ---------- 数据对比弹窗（旧插件 JSON vs 本插件 JSON，左右两栏） ----------
   function cmpLegendHtml() {
     return `<div class="lna-cmp-legend">
-        <span class="is-same">一致</span>
-        <span class="is-diff">不同</span>
-        <span class="is-empty">一边为空</span>
+        <span class="is-same">${t('sync.same')}</span>
+        <span class="is-diff">${t('sync.diff')}</span>
+        <span class="is-empty">${t('sync.oneSideEmpty')}</span>
       </div>`;
   }
 
@@ -2144,14 +2280,15 @@
     const body = dlg.querySelector('.dlg-body');
     if (!body) return;
     const rows = (res && res.rows) || [];
+    const emptyCell = '<em>' + t('sync.emptyCell') + '</em>';
     const cells = rows.map((r) => {
-      const ov = r.old ? esc(r.old) : '<em>（空）</em>';
-      const nv = r.new ? esc(r.new) : '<em>（空）</em>';
+      const ov = r.old ? esc(r.old) : emptyCell;
+      const nv = r.new ? esc(r.new) : emptyCell;
       const same = r.state === 'same';
       // 一致=灰色禁用；不同/一边为空=橙色可点
       const btn = same
-        ? `<button class="dlg-btn lna-cmp-unify is-same" type="button" disabled title="两边数据已一致，无需统一">数据统一化</button>`
-        : `<button class="dlg-btn primary lna-cmp-unify" type="button" data-key="${esc(r.key)}" data-label="${esc(r.label)}" title="选择用哪一边的数据覆盖另一边">数据统一化</button>`;
+        ? `<button class="dlg-btn lna-cmp-unify is-same" type="button" disabled title="${esc(t('sync.unifySameTitle'))}">${t('sync.unify')}</button>`
+        : `<button class="dlg-btn primary lna-cmp-unify" type="button" data-key="${esc(r.key)}" data-label="${esc(r.label)}" title="${esc(t('sync.unifyTitle'))}">${t('sync.unify')}</button>`;
       return `<div class="lna-cmp-label">${esc(r.label)}</div>
         <div class="lna-cmp-val is-${esc(r.state)}">${ov}</div>
         <div class="lna-cmp-val is-${esc(r.state)}">${nv}</div>
@@ -2159,8 +2296,8 @@
     }).join('');
     body.innerHTML = `${cmpLegendHtml()}
       <div class="lna-cmp">
-        <div class="lna-cmp-head">旧插件 JSON<span class="lna-cmp-sub">models/Lora/${esc(res.name)}.json</span></div>
-        <div class="lna-cmp-head">本插件 JSON<span class="lna-cmp-sub">models_json_data/${esc(res.name)}_new.json</span></div>
+        <div class="lna-cmp-head">${t('sync.oldJsonHead')}<span class="lna-cmp-sub">models/Lora/${esc(res.name)}.json</span></div>
+        <div class="lna-cmp-head">${t('sync.newJsonHead')}<span class="lna-cmp-sub">models_json_data/${esc(res.name)}_new.json</span></div>
         <div class="lna-cmp-head lna-cmp-head-op" aria-hidden="true"></div>
         ${cells}
       </div>`;
@@ -2175,30 +2312,31 @@
     dlg.className = 'lna-dialog lna-unify-dlg';
     dlg.setAttribute('role', 'dialog');
     dlg.setAttribute('aria-modal', 'true');
-    dlg.setAttribute('aria-label', '数据统一化');
+    dlg.setAttribute('aria-label', t('sync.unify'));
+    const emptyCell = '<em>' + t('sync.emptyCell') + '</em>';
     dlg.innerHTML = `
       <header>
-        <span class="dlg-title">数据统一化<span class="lna-cf-hint">${esc(row.label)}</span></span>
-        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+        <span class="dlg-title">${t('sync.unify')}<span class="lna-cf-hint">${esc(row.label)}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">
-        <p class="lna-unify-tip">选择保留哪一边的值，点击后会用该值覆盖另一边的 JSON 文件。</p>
+        <p class="lna-unify-tip">${t('sync.unifyTip')}</p>
         <div class="lna-unify-cols">
           <div class="lna-unify-col">
-            <div class="lna-unify-head">旧插件 JSON</div>
-            <div class="lna-unify-val">${row.old ? esc(row.old) : '<em>（空）</em>'}</div>
-            <button class="dlg-btn primary lna-unify-pick" type="button" data-dir="old_to_new">用左侧覆盖右侧</button>
+            <div class="lna-unify-head">${t('sync.oldJsonHead')}</div>
+            <div class="lna-unify-val">${row.old ? esc(row.old) : emptyCell}</div>
+            <button class="dlg-btn primary lna-unify-pick" type="button" data-dir="old_to_new">${t('sync.overwriteLR')}</button>
           </div>
           <div class="lna-unify-col">
-            <div class="lna-unify-head">本插件 JSON</div>
-            <div class="lna-unify-val">${row.new ? esc(row.new) : '<em>（空）</em>'}</div>
-            <button class="dlg-btn primary lna-unify-pick" type="button" data-dir="new_to_old">用右侧覆盖左侧</button>
+            <div class="lna-unify-head">${t('sync.newJsonHead')}</div>
+            <div class="lna-unify-val">${row.new ? esc(row.new) : emptyCell}</div>
+            <button class="dlg-btn primary lna-unify-pick" type="button" data-dir="new_to_old">${t('sync.overwriteRL')}</button>
           </div>
         </div>
         <div class="lna-unify-msg" role="status" aria-live="polite" hidden></div>
       </div>
       <div class="dlg-footer">
-        <button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>
+        <button class="dlg-btn dlg-cancel" data-act="close" type="button">${t('settings.close')}</button>
       </div>`;
     mask.appendChild(dlg);
     document.body.appendChild(mask);
@@ -2232,7 +2370,7 @@
         const picks = Array.from(dlg.querySelectorAll('.lna-unify-pick'));
         picks.forEach((b) => { b.disabled = true; });
         const origText = btn.textContent;
-        btn.innerHTML = '<span class="lna-spinner"></span>覆盖中…';
+        btn.innerHTML = '<span class="lna-spinner"></span>' + t('sync.overwriting');
         let res = null;
         try {
           const r = await fetch(API.syncOldJsonUnify, {
@@ -2249,10 +2387,10 @@
           btn.__lna_busy = false;
           picks.forEach((b) => { b.disabled = false; });
           btn.textContent = origText;
-          setMsg((res && res.error) || '覆盖失败：请求出错', true);
+          setMsg((res && res.error) || t('sync.overwriteFailedReq'), true);
           return;
         }
-        flashToast(`已统一「${row.label}」`);
+        flashToast(t('sync.unifiedToast', { label: row.label }));
         close();
         if (onDone) onDone();
       });
@@ -2267,17 +2405,17 @@
     dlg.className = 'lna-dialog lna-cmp-dlg';
     dlg.setAttribute('role', 'dialog');
     dlg.setAttribute('aria-modal', 'true');
-    dlg.setAttribute('aria-label', '数据对比');
+    dlg.setAttribute('aria-label', t('sync.compareTitle'));
     dlg.innerHTML = `
       <header>
-        <span class="dlg-title">数据对比<span class="lna-cf-hint">${esc(name)}</span></span>
-        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+        <span class="dlg-title">${t('sync.compareTitle')}<span class="lna-cf-hint">${esc(name)}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">
-        <div class="dlg-loading" role="status" aria-live="polite"><span class="lna-spinner" aria-hidden="true"></span>正在读取数据…</div>
+        <div class="dlg-loading" role="status" aria-live="polite"><span class="lna-spinner" aria-hidden="true"></span>${t('sync.loadingCompare')}</div>
       </div>
       <div class="dlg-footer">
-        <button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>
+        <button class="dlg-btn dlg-cancel" data-act="close" type="button">${t('settings.close')}</button>
       </div>`;
     mask.appendChild(dlg);
     document.body.appendChild(mask);
@@ -2314,7 +2452,7 @@
       }
       if (!document.contains(dlg)) return null; // 弹窗已被关闭，丢弃结果
       if (!data || !data.ok) {
-        body.innerHTML = `<div class="dlg-empty">${esc((data && data.error) || '读取数据失败')}</div>`;
+        body.innerHTML = `<div class="dlg-empty">${esc((data && data.error) || t('sync.readCompareFailed'))}</div>`;
         return null;
       }
       dlg.__lnaCompare = data;
@@ -2357,8 +2495,8 @@
       btn.disabled = true;
       btn.setAttribute('aria-busy', 'true');
       const origText = btn.textContent;
-      btn.innerHTML = '<span class="lna-spinner"></span>正在同步…';
-      setSyncProgress(modal, '正在扫描旧插件 JSON…');
+      btn.innerHTML = '<span class="lna-spinner"></span>' + t('sync.syncing');
+      setSyncProgress(modal, t('sync.scanningJson'));
       let res = null;
       try {
         const r = await fetch(API.syncOldJson, { method: 'POST' });
@@ -2372,17 +2510,17 @@
       btn.removeAttribute('aria-busy');
       btn.textContent = origText;
       if (!res || !res.ok) {
-        setSyncProgress(modal, (res && res.error) || '同步失败：请求出错', true);
+        setSyncProgress(modal, (res && res.error) || t('sync.syncFailedReq'), true);
         return;
       }
       const conflicts = res.conflicts || [];
       const parts = [];
-      if (res.created) parts.push(`新建 ${res.created} 项`);
-      if (res.filled) parts.push(`补齐 ${res.filled} 项`);
+      if (res.created) parts.push(t('sync.createdCount', { n: res.created }));
+      if (res.filled) parts.push(t('sync.filledCount', { n: res.filled }));
       const summary = parts.length
-        ? `已同步：${parts.join('，')}`
-        : '没有可同步的旧资料（旧 JSON 无内容或已同步）';
-      setSyncProgress(modal, conflicts.length ? `${summary}；${conflicts.length} 项冲突待处理` : summary, conflicts.length > 0);
+        ? t('sync.syncedSummary', { parts: parts.join(t('sync.listSep')) })
+        : t('sync.nothingToSync');
+      setSyncProgress(modal, conflicts.length ? t('sync.conflictsSummary', { summary, n: conflicts.length }) : summary, conflicts.length > 0);
       renderSyncConflicts(modal, conflicts);
       if (res.created || res.filled) {
         try {
@@ -2390,7 +2528,7 @@
           await loadDir(state.currentPath);
           renderFull(getActiveRoot());
         } catch (e) { /* 刷新失败不影响同步结果展示 */ }
-        flashToast(`已同步 ${(res.created || 0) + (res.filled || 0)} 项旧资料`);
+        flashToast(t('sync.syncedToast', { n: (res.created || 0) + (res.filled || 0) }));
       }
     });
 
@@ -2417,13 +2555,13 @@
           if (!res || !res.ok) {
             ob.__lna_busy = false;
             ob.disabled = false;
-            flashToast('覆盖失败：' + ((res && res.error) || '未知错误'), true);
+            flashToast(t('sync.overwriteFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
             return;
           }
         } catch (err) {
           ob.__lna_busy = false;
           ob.disabled = false;
-          flashToast('覆盖失败：请求出错', true);
+          flashToast(t('sync.overwriteFailedReq'), true);
           return;
         }
         if (!document.contains(modal)) return;
@@ -2431,9 +2569,9 @@
         if (li) li.remove();
         const left = ul.querySelectorAll('.lna-sync-item').length;
         const countEl = modal.querySelector('.lna-sync-conflicts-count');
-        if (countEl) countEl.textContent = `（${left} 项）`;
+        if (countEl) countEl.textContent = t('sync.itemsCount', { n: left });
         if (wrap && left === 0) wrap.hidden = true;
-        flashToast('已用旧 JSON 覆盖');
+        flashToast(t('sync.overwrittenToast'));
         try {
           await loadDir(state.currentPath);
           renderFull(getActiveRoot());
@@ -2453,10 +2591,9 @@
     const arrow = root.querySelector('.lna-sort-arrow');
 
     function render() {
-      const opt = SORT_OPTIONS.find((o) => o.value === state.sortKey);
-      valueEl.textContent = opt.label;
-      const dirLabel = state.sortDir === 'asc' ? '升序' : '降序';
-      dirBtn.setAttribute('aria-label', '排序方向：' + dirLabel);
+      valueEl.textContent = sortLabel(state.sortKey);
+      const dirLabel = state.sortDir === 'asc' ? t('sort.dirAsc') : t('sort.dirDesc');
+      dirBtn.setAttribute('aria-label', t('sort.dirAria', { dir: dirLabel }));
       dirBtn.setAttribute('title', dirLabel);
       arrow.setAttribute('d', state.sortDir === 'asc'
         ? 'M12 19V5M5 12l7-7 7 7'
@@ -2480,7 +2617,7 @@
       const menu = document.createElement('div');
       menu.className = 'lna-dd-menu';
       menu.setAttribute('role', 'listbox');
-      menu.setAttribute('aria-label', '排序方式');
+      menu.setAttribute('aria-label', t('sort.menuAria'));
       menu.style.top = (r.bottom + 4) + 'px';
       menu.style.left = r.left + 'px';
       SORT_OPTIONS.forEach((o) => {
@@ -2489,7 +2626,7 @@
         item.className = 'lna-dd-item' + (o.value === state.sortKey ? ' selected' : '');
         item.setAttribute('role', 'option');
         item.setAttribute('aria-selected', o.value === state.sortKey ? 'true' : 'false');
-        item.innerHTML = `<span>${esc(o.label)}</span><span class="lna-dd-check" aria-hidden="true">✓</span>`;
+        item.innerHTML = `<span>${esc(sortLabel(o.value))}</span><span class="lna-dd-check" aria-hidden="true">✓</span>`;
         item.addEventListener('click', () => {
           state.sortKey = o.value;
           saveSettings(); // 记忆排序方式
@@ -2536,9 +2673,9 @@
   async function copyText(text) {
     try {
       await navigator.clipboard.writeText(text);
-      flashToast('已复制：' + text);
+      flashToast(t('toast.copied', { text }));
     } catch (err) {
-      flashToast('复制失败，请手动复制');
+      flashToast(t('toast.copyFailed'));
     }
   }
 
@@ -2564,13 +2701,13 @@
   ];
 
   function tagsHtml(tags, tipText, opts) {
-    if (!tags || !tags.length) return '<span class="lna-cf-empty">（该模型未记录训练标签）</span>';
+    if (!tags || !tags.length) return `<span class="lna-cf-empty">${t('cf.noTags')}</span>`;
     // plain=true：【将译文加入词典】弹窗专用，不下发彩色底，底色改由 CSS 按「是否已收录」统一分配
     const plain = !!(opts && opts.plain);
     return tags.map(([tag, cnt], i) => {
       const [bg, fg] = TAG_PALETTE[i % TAG_PALETTE.length];
       // .lna-tag-row 保持原有的「英文标签 + 计数」横排；.lna-tag-zh 为中文翻译（默认隐藏）
-      const tip = tipText || '点击添加/移除触发词';
+      const tip = tipText || t('cf.tagTipDefault');
       const style = plain ? '' : ` style="--lna-tag-bg:${bg};--lna-tag-count-bg:${fg}"`;
       return `<button class="lna-tag" type="button" data-tag="${esc(tag)}" aria-pressed="false" title="${esc(tip)}"${style}><span class="lna-tag-row"><span class="lna-tag-text">${esc(tag)}</span><span class="lna-tag-count">${esc(cnt)}</span></span><span class="lna-tag-zh"></span></button>`;
     }).join('');
@@ -2640,7 +2777,7 @@
         // 翻译在途：吞掉点击（含按钮自身的关闭/保存监听），只给提示
         e.preventDefault();
         e.stopPropagation();
-        flashToast('正在翻译中，暂时无法操作', true);
+        flashToast(t('toast.translating'), true);
       };
       dlg.__lnaBlockHandler = handler;
       dlg.addEventListener('click', handler, true); // 捕获阶段先于按钮监听执行
@@ -2687,7 +2824,7 @@
       try {
         // 显式触发：先等其它标签页的翻译结束再发起自己的，避免并发
         if (waitIdle && !(await zhWaitIdle(body, 180000))) {
-          if (document.contains(body)) flashToast('翻译失败：其它翻译任务长时间未完成', true);
+          if (document.contains(body)) flashToast(t('tag.translateTimeout'), true);
           return false;
         }
         let r = await fetch(API.translate, {
@@ -2700,7 +2837,7 @@
         // 状态查询与提交之间仍可能有竞态（别的标签页抢先）：等空闲后重试一次
         if (res && res.busy) {
           if (!(await zhWaitIdle(body, 180000))) {
-            if (document.contains(body)) flashToast('翻译失败：其它翻译任务长时间未完成', true);
+            if (document.contains(body)) flashToast(t('tag.translateTimeout'), true);
             return false;
           }
           r = await fetch(API.translate, {
@@ -2711,11 +2848,11 @@
           res = await r.json();
         }
         if (!r.ok) {
-          flashToast(`翻译失败：接口不可用（HTTP ${r.status}），请重启 WebUI 后重试`);
+          flashToast(t('tag.translateHttpFailed', { code: r.status }));
           return false;
         }
         if (!res || !res.ok) {
-          flashToast('翻译失败：' + ((res && res.error) || '未知错误'));
+          flashToast(t('tag.translateFailed', { msg: (res && res.error) || t('toast.unknownError') }));
           return false;
         }
         if (!document.contains(body)) return false; // 弹窗已关闭
@@ -2724,7 +2861,7 @@
         applyTagTranslations(body, res.translations || {}, true); // 合并：子集翻译不清空其余对照
         return true;
       } catch (e) {
-        flashToast('翻译失败：请求出错');
+        flashToast(t('tag.translateFailedReq'));
         return false;
       } finally {
         body.__lnaZhPromise = null;
@@ -2748,21 +2885,21 @@
     dlg.className = 'lna-dialog lna-repick-dlg';
     dlg.setAttribute('role', 'dialog');
     dlg.setAttribute('aria-modal', 'true');
-    dlg.setAttribute('aria-label', '选择标签重新翻译');
+    dlg.setAttribute('aria-label', t('cf.repickLabel'));
     dlg.innerHTML = `
       <header>
-        <span class="dlg-title">选择标签重新翻译<span class="lna-cf-hint">勾选要重新翻译的标签；未勾选任何标签时点击确认将直接关闭</span></span>
-        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+        <span class="dlg-title">${t('cf.repickLabel')}<span class="lna-cf-hint">${t('tag.repickHint')}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">
         <div class="lna-cf-field">
-          <div class="lna-cf-tags show-zh">${tagsHtml(info.tags, '点击选择/取消要重新翻译的标签')}</div>
+          <div class="lna-cf-tags show-zh">${tagsHtml(info.tags, t('tag.pickRepickTag'))}</div>
         </div>
       </div>
       <div class="dlg-footer">
         <span class="lna-zh-time" role="status" aria-live="polite"></span>
-        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">关闭</button>
-        <button class="dlg-btn primary lna-zh-repick" data-act="repick" type="button"><span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-repick-label">确认重新翻译</span></button>
+        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('settings.close')}</button>
+        <button class="dlg-btn primary lna-zh-repick" data-act="repick" type="button"><span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-repick-label">${t('tag.confirmRepick')}</span></button>
       </div>`;
     mask.appendChild(dlg);
     document.body.appendChild(mask);
@@ -2810,7 +2947,7 @@
       if (!tags.length) { close(); return; } // 个数为 0：直接关闭，不进入翻译流程
       okBtn.classList.add('busy');
       spinner.hidden = false;
-      label.textContent = '正在翻译...';
+      label.textContent = t('tag.translatingDots');
       if (timeEl) { timeEl.textContent = ''; timeEl.classList.remove('is-err'); }
       setDlgBusy(dlg.querySelector('.dlg-body'), true); // 在途禁止关闭小弹窗
       const t0 = performance.now();
@@ -2820,11 +2957,11 @@
       if (closed || !document.contains(dlg)) return;
       okBtn.classList.remove('busy');
       spinner.hidden = true;
-      label.textContent = '确认重新翻译';
+      label.textContent = t('tag.confirmRepick');
       setDlgBusy(dlg.querySelector('.dlg-body'), false);
       if (timeEl) {
-        if (ok) timeEl.textContent = `上次用时 ${secs} 秒`;
-        else { timeEl.textContent = '翻译失败'; timeEl.classList.add('is-err'); }
+        if (ok) timeEl.textContent = t('cf.lastTook', { secs });
+        else { timeEl.textContent = t('cf.translateFailed'); timeEl.classList.add('is-err'); }
       }
       // 把主弹窗合并后的最新译文刷回小弹窗内的标签
       const map = body.__lnaZhMap || {};
@@ -2853,8 +2990,8 @@
     const zhText = zh || '';
     return `
         <div class="lna-dict-line">
-          <div class="lna-dict-row"><span class="lna-dict-k">标签</span><span class="lna-dict-v">${tag ? esc(tag) : '<em class="lna-dict-none">（无）</em>'}</span></div>
-          <div class="lna-dict-row"><span class="lna-dict-k">当前译文</span><span class="lna-dict-v">${zhText ? esc(zhText) : '<em class="lna-dict-none">（无译文）</em>'}</span></div>
+          <div class="lna-dict-row"><span class="lna-dict-k">${t('tag.keyLabel')}</span><span class="lna-dict-v">${tag ? esc(tag) : `<em class="lna-dict-none">${t('tag.none')}</em>`}</span></div>
+          <div class="lna-dict-row"><span class="lna-dict-k">${t('tag.currentZh')}</span><span class="lna-dict-v">${zhText ? esc(zhText) : `<em class="lna-dict-none">${t('tag.noZh')}</em>`}</span></div>
         </div>`;
   }
 
@@ -2915,32 +3052,32 @@
     dlg.className = 'lna-dialog lna-repick-dlg';
     dlg.setAttribute('role', 'dialog');
     dlg.setAttribute('aria-modal', 'true');
-    dlg.setAttribute('aria-label', '将译文加入词典');
+    dlg.setAttribute('aria-label', t('cf.dictLabel'));
     // 结果区骨架：占位 / 查询中 / 结果三态共用同一结构，切换时高度不变，
     // 避免弹窗上下跳动（弹窗在遮罩里垂直居中，高度一变就会被重新居中）
     function dictSkeleton(tag, zh, matchHtml, btnLabel, canWrite) {
       return `${dictRowTagZh(tag, zh)}
         <div class="lna-dict-line">
-          <div class="lna-dict-row"><span class="lna-dict-k">词典匹配</span><span class="lna-dict-v">${matchHtml}</span></div>
+          <div class="lna-dict-row"><span class="lna-dict-k">${t('tag.dictMatch')}</span><span class="lna-dict-v">${matchHtml}</span></div>
           <button class="dlg-btn primary lna-dict-save" type="button"${canWrite ? '' : ' aria-disabled="true"'}>${btnLabel}</button>
         </div>`;
     }
     // 未选择标签时的占位结果：与选中态同结构，按钮置灰不可写
-    const emptyResultHtml = dictSkeleton('', '', '<em class="lna-dict-none">（无，请选择上方一个标签）</em>', '添加到词典', false);
+    const emptyResultHtml = dictSkeleton('', '', `<em class="lna-dict-none">${t('tag.selectTagHint')}</em>`, t('tag.addToDict'), false);
     dlg.innerHTML = `
       <header>
-        <span class="dlg-title">将译文加入词典<span class="lna-cf-hint">单选标签后查询词典；已有译文才可写入</span></span>
-        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+        <span class="dlg-title">${t('cf.dictLabel')}<span class="lna-cf-hint">${t('tag.dictHint')}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">
         <div class="lna-cf-field">
-          <div class="lna-cf-tags show-zh lna-dict-tags">${tagsHtml(info.tags, '点击选择要写入词典的标签（单选）', { plain: true })}</div>
+          <div class="lna-cf-tags show-zh lna-dict-tags">${tagsHtml(info.tags, t('tag.pickDictTag'), { plain: true })}</div>
         </div>
         <div class="lna-dict-result" role="status" aria-live="polite">${emptyResultHtml}
         </div>
       </div>
       <div class="dlg-footer">
-        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">关闭</button>
+        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('settings.close')}</button>
       </div>`;
     mask.appendChild(dlg);
     document.body.appendChild(mask);
@@ -2980,28 +3117,28 @@
       const zhText = zh || '';
       if (!lookup || !lookup.ok) {
         resultBox.innerHTML = dictSkeleton(tag, zhText,
-          `<span class="lna-dict-tip is-err">词典查询失败：${esc((lookup && lookup.error) || '接口不可用，请重启 WebUI')}</span>`,
-          '添加到词典', false);
+          `<span class="lna-dict-tip is-err">${t('tag.dictQueryFailed', { msg: (lookup && lookup.error) || t('tag.apiUnavailable') })}</span>`,
+          t('tag.addToDict'), false);
         return;
       }
       const dictVal = lookup.dict_value || '';
       const canWrite = !!zhText;
-      const btnLabel = lookup.found ? '替换词典译文' : '添加到词典';
+      const btnLabel = lookup.found ? t('tag.replaceDict') : t('tag.addToDict');
       // 「词典匹配」行配色：已收录且与当前译文一致 → 绿；已收录但与译文不同 → 黄橙；未收录 → 红
       const same = !!zhText && normZh(zhText) === normZh(dictVal);
       const matchHtml = !lookup.found
-        ? '<b class="lna-dict-miss">未收录（词典中没有该标签）</b>'
-        : `<span class="${same ? 'lna-dict-hit' : 'lna-dict-diff'}">已收录，现值：<b>${esc(dictVal)}</b></span>`;
+        ? `<b class="lna-dict-miss">${t('tag.notInDict')}</b>`
+        : `<span class="${same ? 'lna-dict-hit' : 'lna-dict-diff'}">${t('tag.inDictValue', { v: esc(dictVal) })}</span>`;
       // 两行布局：行1=标签+当前译文，行2=词典匹配+按钮（按钮固定右端，避免文案长短变化导致按钮跳动）
       resultBox.innerHTML = dictSkeleton(tag, zhText, matchHtml, btnLabel, canWrite);
       const saveBtn = resultBox.querySelector('.lna-dict-save');
       if (saveBtn) {
         saveBtn.addEventListener('click', async () => {
           if (saveBtn.classList.contains('busy') || saveBtn.getAttribute('aria-disabled') === 'true') return;
-          if (!canWrite) { flashToast('该标签暂无译文，无法写入词典', true); return; }
+          if (!canWrite) { flashToast(t('tag.noZhToWrite'), true); return; }
           saveBtn.classList.add('busy');
           const oldText = saveBtn.textContent;
-          saveBtn.textContent = '正在写入...';
+          saveBtn.textContent = t('tag.writing');
           try {
             const r = await fetch(API.dictUpsert, {
               method: 'POST',
@@ -3010,16 +3147,16 @@
             });
             const res = await r.json();
             if (res && res.ok) {
-              flashToast(lookup.found ? `已替换词典对照：${tag}` : `已添加到词典：${tag}`);
+              flashToast(lookup.found ? t('tag.replacedDictToast', { tag }) : t('tag.addedDictToast', { tag }));
               markDictMatched(dlg, tag); // 写入成功 → 该标签样式更新为「已收录」绿色
               if (selected === tag) renderResult(tag, zhText, { ok: true, key: res.key, found: true, dict_value: res.value });
             } else {
-              flashToast('写入失败：' + ((res && res.error) || '未知错误'), true);
+              flashToast(t('tag.writeFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
               saveBtn.classList.remove('busy');
               saveBtn.textContent = oldText;
             }
           } catch (e) {
-            flashToast('写入失败：请求出错', true);
+            flashToast(t('tag.writeFailedReq'), true);
             saveBtn.classList.remove('busy');
             saveBtn.textContent = oldText;
           }
@@ -3046,7 +3183,7 @@
         const seq = ++reqSeq;
         const zhText = zhMap[tag] && zhMap[tag] !== tag ? zhMap[tag] : '';
         // 查询中沿用同一骨架（仅「词典匹配」换文案），高度不变
-        resultBox.innerHTML = dictSkeleton(tag, zhText, '<em class="lna-dict-none">正在查询词典…</em>', '添加到词典', false);
+        resultBox.innerHTML = dictSkeleton(tag, zhText, `<em class="lna-dict-none">${t('tag.queryingDict')}</em>`, t('tag.addToDict'), false);
         try {
           const r = await fetch(`${API.dictLookup}?tag=${encodeURIComponent(tag)}`);
           const res = await r.json();
@@ -3054,7 +3191,7 @@
           renderResult(tag, zhText, res);
         } catch (e) {
           if (closed || seq !== reqSeq || !document.contains(dlg)) return;
-          resultBox.innerHTML = dictSkeleton(tag, zhText, '<span class="lna-dict-tip is-err">词典查询失败：请求出错</span>', '添加到词典', false);
+          resultBox.innerHTML = dictSkeleton(tag, zhText, `<span class="lna-dict-tip is-err">${t('tag.dictQueryFailedReq')}</span>`, t('tag.addToDict'), false);
         }
       });
     });
@@ -3072,31 +3209,31 @@
     dlg.className = 'lna-dialog lna-repick-dlg';
     dlg.setAttribute('role', 'dialog');
     dlg.setAttribute('aria-modal', 'true');
-    dlg.setAttribute('aria-label', '人工修正译文');
+    dlg.setAttribute('aria-label', t('cf.editZhLabel'));
     // 空态 / 选中态共用同一结构，只换文本与输入框，高度不变，弹窗不抖动
     function skeleton(tag, zh) {
       const on = !!tag;
       return `${dictRowTagZh(tag, on ? zh : '')}
         <div class="lna-dict-line">
-          <span class="lna-dict-k">修正译文</span>
-          <input class="lna-mt-input" type="text" placeholder="填写该标签的中文译文" aria-label="修正译文" value="${on ? esc(zh) : ''}"${on ? '' : ' disabled'}>
-          <button class="dlg-btn lna-save-blue lna-dict-save" type="button"${on ? '' : ' aria-disabled="true"'}>修改译文</button>
+          <span class="lna-dict-k">${t('tag.fixZh')}</span>
+          <input class="lna-mt-input" type="text" placeholder="${esc(t('tag.fixZhPlaceholder'))}" aria-label="${esc(t('tag.fixZh'))}" value="${on ? esc(zh) : ''}"${on ? '' : ' disabled'}>
+          <button class="dlg-btn lna-save-blue lna-dict-save" type="button"${on ? '' : ' aria-disabled="true"'}>${t('tag.modifyZh')}</button>
         </div>`;
     }
     dlg.innerHTML = `
       <header>
-        <span class="dlg-title">人工修正译文<span class="lna-cf-hint">单选标签后手工填写译文；保存后立即生效</span></span>
-        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+        <span class="dlg-title">${t('cf.editZhLabel')}<span class="lna-cf-hint">${t('tag.manualHint')}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">
         <div class="lna-cf-field">
-          <div class="lna-cf-tags show-zh">${tagsHtml(info.tags, '点击选择要修正译文的标签（单选）')}</div>
+          <div class="lna-cf-tags show-zh">${tagsHtml(info.tags, t('tag.pickFixTag'))}</div>
         </div>
         <div class="lna-dict-result" role="status" aria-live="polite">${skeleton('', '')}
         </div>
       </div>
       <div class="dlg-footer">
-        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">关闭</button>
+        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('settings.close')}</button>
       </div>`;
     mask.appendChild(dlg);
     document.body.appendChild(mask);
@@ -3155,9 +3292,9 @@
       btn.addEventListener('click', async () => {
         if (btn.classList.contains('busy')) return;
         const val = input.value.trim();
-        if (!val) { flashToast('请先填写译文', true); input.focus(); return; }
+        if (!val) { flashToast(t('tag.needZh'), true); input.focus(); return; }
         btn.classList.add('busy');
-        btn.textContent = '正在保存...';
+        btn.textContent = t('tag.saving');
         try {
           const r = await fetch(API.tagTranslation, {
             method: 'POST',
@@ -3169,18 +3306,18 @@
           if (res && res.ok) {
             applyTagTranslations(body, { [tag]: val }, true); // 卡片设置页的标签即时更新
             syncDlgTags();                                   // 本弹窗标签区的译文同步刷新
-            flashToast(`已修正译文：${tag}`);
+            flashToast(t('tag.fixedZhToast', { tag }));
             if (selected === tag) render(tag);                // 重绘：同步「当前译文」并复位按钮
           } else {
-            flashToast('保存失败：' + ((res && res.error) || '未知错误'), true);
+            flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
             btn.classList.remove('busy');
-            btn.textContent = '修改译文';
+            btn.textContent = t('tag.modifyZh');
           }
         } catch (e) {
           if (!document.contains(dlg)) return;
-          flashToast('保存失败：请求出错', true);
+          flashToast(t('toast.saveFailedReq'), true);
           btn.classList.remove('busy');
-          btn.textContent = '修改译文';
+          btn.textContent = t('tag.modifyZh');
         }
       });
     }
@@ -3235,7 +3372,7 @@
   // 参考内置 sd_forge_lora 的「替换预览图像」：把输出图库中选中的生成图像存为该卡片预览图
   async function applyGeneratedPreview(endpoint, rel, scope, card) {
     const src = pickGeneratedImageSrc();
-    if (!src) { flashToast('未找到生成图像，请先在输出图库中生成或选中一张'); return; }
+    if (!src) { flashToast(t('toast.noGeneratedImage')); return; }
     let blob = null;
     try {
       const rr = await fetch(src);
@@ -3243,7 +3380,7 @@
     } catch (e) {
       blob = null;
     }
-    if (!blob || !blob.size) { flashToast('读取生成图像失败'); return; }
+    if (!blob || !blob.size) { flashToast(t('toast.readImageFailed')); return; }
     const fd = new FormData();
     fd.append('file', blob, 'preview.png');
     try {
@@ -3258,12 +3395,12 @@
         card.preview = res.preview;
         card.preview_ver = res.preview_ver;
         renderAll(); // 同步卡片缩略图/封面
-        flashToast('已使用生成图像替换预览图');
+        flashToast(t('cf.previewFromGenerated'));
       } else {
-        flashToast('替换失败：' + ((res && res.error) || '未知错误'));
+        flashToast(t('toast.replaceFailed', { msg: (res && res.error) || t('toast.unknownError') }));
       }
     } catch (e) {
-      flashToast('替换失败：请求出错');
+      flashToast(t('toast.replaceFailedReq'));
     }
   }
 
@@ -3280,12 +3417,12 @@
       <div class="lna-cf-top">
         <div class="lna-cf-top-main">
           <label class="lna-cf-field">
-            <span class="lna-cf-label">描述</span>
+            <span class="lna-cf-label">${t('cf.description')}</span>
             <textarea class="lna-cf-input lna-cf-desc" rows="4">${esc(u.description || '')}</textarea>
           </label>
           ${metaTableHtml(info.table)}
           <div class="lna-cf-field">
-            <span class="lna-cf-label">基础模型</span>
+            <span class="lna-cf-label">${t('cf.baseModel')}</span>
             <div class="lna-cf-radio">
               ${SD_VERSIONS.map((v) => `<label class="lna-cf-radio-item"><input type="radio" name="lna-sdver" value="${v}"${curVer === v ? ' checked' : ''}><span>${v}</span></label>`).join('')}
             </div>
@@ -3293,56 +3430,56 @@
         </div>
         <div class="lna-cf-top-side">
           <div class="lna-cf-preview${info.preview ? '' : ' is-empty'}"${coverStyle}>
-            <span class="lna-cf-preview-hint">暂无预览图</span>
+            <span class="lna-cf-preview-hint">${t('cf.previewHint')}</span>
           </div>
-          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">浏览并替换预览图像</button>
-          <button class="dlg-btn dlg-action lna-cf-use-gen" type="button" data-act="use-generated">将生成的图像作为预览图像</button>
+          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">${t('cf.replacePreview')}</button>
+          <button class="dlg-btn dlg-action lna-cf-use-gen" type="button" data-act="use-generated">${t('cf.useGenerated')}</button>
         </div>
       </div>
       <div class="lna-cf-field">
         <div class="lna-cf-tags-head">
-          <span class="lna-cf-label lna-cf-tags-title">数据集的训练标签<span class="lna-cf-hint">点击标签可加入/移出触发词</span></span>
+          <span class="lna-cf-label lna-cf-tags-title">${t('cf.tagsTitle')}<span class="lna-cf-hint">${t('cf.tagsHint')}</span></span>
         </div>
         <div class="lna-cf-tags${state.showTagZh ? ' show-zh' : ''}">${tagsHtml(info.tags)}</div>
         ${hasTags ? `
         <div class="lna-cf-tags-actions">
-          <div class="lna-zh-switch" role="group" aria-label="标签翻译显示开关">
-            <button class="lna-zh-key${state.showTagZh ? '' : ' active'}" type="button" data-zh="0" aria-pressed="${state.showTagZh ? 'false' : 'true'}">隐藏翻译</button>
-            <button class="lna-zh-key${state.showTagZh ? ' active' : ''}" type="button" data-zh="1" aria-pressed="${state.showTagZh ? 'true' : 'false'}">显示翻译</button>
+          <div class="lna-zh-switch" role="group" aria-label="${esc(t('cf.zhGroupAria'))}">
+            <button class="lna-zh-key${state.showTagZh ? '' : ' active'}" type="button" data-zh="0" aria-pressed="${state.showTagZh ? 'false' : 'true'}">${t('cf.zhHide')}</button>
+            <button class="lna-zh-key${state.showTagZh ? ' active' : ''}" type="button" data-zh="1" aria-pressed="${state.showTagZh ? 'true' : 'false'}">${t('cf.zhShow')}</button>
           </div>
           ${modeGroupHtml()}
-          <button class="dlg-btn dlg-action lna-cf-zh-all" type="button" title="批量翻译当前卡片的全部训练标签">${ICON.translateAll}<span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-all-label">翻译所有标签</span></button>
-          <button class="dlg-btn dlg-action lna-cf-zh-missing" type="button" title="只翻译当前还没有中文对照的标签（已有对照的沿用，不调用模型）">${ICON.incomplete}<span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-missing-label">翻译未完成标签</span></button>
-          <button class="dlg-btn dlg-action lna-cf-zh-pick" type="button" title="勾选训练标签后重新翻译（跳过缓存，覆盖旧译文）">${ICON.retranslate}选择标签重新翻译</button>
-          <button class="dlg-btn dlg-action lna-cf-zh-edit" type="button" title="单选训练标签，手工填写/修正其中文译文">${ICON.editZh}人工修正译文</button>
-          <button class="dlg-btn dlg-action lna-cf-dict" type="button" title="单选训练标签，把其当前译文写入翻译词典">${ICON.addDict}将译文加入词典</button>
+          <button class="dlg-btn dlg-action lna-cf-zh-all" type="button" title="${esc(t('cf.translateAllTitle'))}">${ICON.translateAll}<span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-all-label">${t('cf.translateAllLabel')}</span></button>
+          <button class="dlg-btn dlg-action lna-cf-zh-missing" type="button" title="${esc(t('cf.translateMissingTitle'))}">${ICON.incomplete}<span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-zh-missing-label">${t('cf.translateMissingLabel')}</span></button>
+          <button class="dlg-btn dlg-action lna-cf-zh-pick" type="button" title="${esc(t('cf.repickTitle'))}">${ICON.retranslate}${t('cf.repickLabel')}</button>
+          <button class="dlg-btn dlg-action lna-cf-zh-edit" type="button" title="${esc(t('cf.editZhTitle'))}">${ICON.editZh}${t('cf.editZhLabel')}</button>
+          <button class="dlg-btn dlg-action lna-cf-dict" type="button" title="${esc(t('cf.dictTitle'))}">${ICON.addDict}${t('cf.dictLabel')}</button>
           <span class="lna-zh-time" role="status" aria-live="polite"></span>
         </div>` : ''}
       </div>
       <label class="lna-cf-field">
-        <span class="lna-cf-label">触发词<span class="lna-cf-hint">会和 Lora 一起添加到提示词中</span></span>
+        <span class="lna-cf-label">${t('cf.activation')}<span class="lna-cf-hint">${t('cf.activationHint')}</span></span>
         <textarea class="lna-cf-input lna-cf-activation" rows="2">${esc(u.activation_text || '')}</textarea>
       </label>
       <div class="lna-cf-field">
-        <span class="lna-cf-label">推荐权重<span class="lna-cf-hint">设置为 0 以禁用</span></span>
+        <span class="lna-cf-label">${t('cf.weight')}<span class="lna-cf-hint">${t('cf.weightHint')}</span></span>
         <div class="lna-cf-weight">
-          <input type="range" class="lna-cf-weight-range" min="0" max="2" step="0.01" value="${weight}" aria-label="推荐权重滑块">
-          <input type="number" class="lna-cf-weight-num" min="0" max="2" step="0.01" value="${weight}" aria-label="推荐权重数值">
+          <input type="range" class="lna-cf-weight-range" min="0" max="2" step="0.01" value="${weight}" aria-label="${esc(t('cf.weightRangeAria'))}">
+          <input type="number" class="lna-cf-weight-num" min="0" max="2" step="0.01" value="${weight}" aria-label="${esc(t('cf.weightNumAria'))}">
         </div>
       </div>
       <label class="lna-cf-field">
-        <span class="lna-cf-label">反向提示词<span class="lna-cf-hint">会被添加到反向提示词中</span></span>
+        <span class="lna-cf-label">${t('cf.negative')}<span class="lna-cf-hint">${t('cf.negativeHint')}</span></span>
         <textarea class="lna-cf-input lna-cf-negative" rows="2">${esc(u.negative_text || '')}</textarea>
       </label>
       <div class="lna-cf-field">
-        <span class="lna-cf-label">随机提示词</span>
+        <span class="lna-cf-label">${t('cf.random')}</span>
         <div class="lna-cf-random-row">
           <textarea class="lna-cf-input lna-cf-random" rows="4" readonly></textarea>
-          <button class="dlg-btn lna-cf-gen" type="button">生成</button>
+          <button class="dlg-btn lna-cf-gen" type="button">${t('cf.gen')}</button>
         </div>
       </div>
       <label class="lna-cf-field">
-        <span class="lna-cf-label">注意事项</span>
+        <span class="lna-cf-label">${t('cf.notes')}</span>
         <textarea class="lna-cf-input lna-cf-notes" rows="4">${esc(u.notes || '')}</textarea>
       </label>
     </div>`;
@@ -3360,19 +3497,19 @@
 
     let fileInput = null;
     const dlg = openModal({
-      title: `卡片设置 · ${l.name}`,
+      title: t('cf.title', { name: l.name }),
       locked: true,
       bodyHtml: `<div class="dlg-loading" role="status" aria-live="polite">
-        <span class="lna-spinner" aria-hidden="true"></span>正在读取卡片信息…</div>`,
-      footerHtml: `<button class="dlg-btn dlg-cancel" data-act="cancel" type="button">取消</button>
-        <button class="dlg-btn primary" data-act="save" type="button">保存</button>`,
+        <span class="lna-spinner" aria-hidden="true"></span>${t('cf.loadingCard')}</div>`,
+      footerHtml: `<button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('cf.cancel')}</button>
+        <button class="dlg-btn primary" data-act="save" type="button">${t('settings.save')}</button>`,
       onOpen(modal) {
         modal.querySelector('[data-act="cancel"]').addEventListener('click', () => closeModal(modal));
 
         // 替换按钮在内容区、异步渲染后才出现，故用事件委托
         modal.addEventListener('click', (e) => {
           if (e.target.closest('[data-act="replace"]')) {
-            if (!fileInput) { flashToast('卡片信息还在加载，请稍候'); return; }
+            if (!fileInput) { flashToast(t('toast.cardLoading')); return; }
             fileInput.click();
             return;
           }
@@ -3383,7 +3520,7 @@
 
         modal.querySelector('[data-act="save"]').addEventListener('click', async () => {
           const desc = modal.querySelector('.lna-cf-desc');
-          if (!desc) { flashToast('卡片信息还在加载，请稍候'); return; }
+          if (!desc) { flashToast(t('toast.cardLoading')); return; }
           const ver = modal.querySelector('input[name="lna-sdver"]:checked');
           const wNum = modal.querySelector('.lna-cf-weight-num');
           const payload = {
@@ -3402,10 +3539,10 @@
               body: JSON.stringify(payload),
             });
             const res = await r.json();
-            if (res && res.ok) { closeModal(modal); flashToast('已保存卡片设置'); }
-            else flashToast('保存失败：' + ((res && res.error) || '未知错误'));
+            if (res && res.ok) { closeModal(modal); flashToast(t('toast.cardSaved')); }
+            else flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }));
           } catch (e) {
-            flashToast('保存失败：请求出错');
+            flashToast(t('toast.saveFailedReq'));
           }
         });
       },
@@ -3417,11 +3554,11 @@
       const r = await fetch(`${API.cardInfo}?rel=${encodeURIComponent(l.rel)}`);
       info = await r.json();
     } catch (e) {
-      info = { ok: false, error: '读取请求失败' };
+      info = { ok: false, error: t('toast.readReqFailed') };
     }
     if (!document.contains(dlg)) return; // 弹窗已被关闭
     if (!info || !info.ok) {
-      body.innerHTML = `<div class="dlg-empty">${esc((info && info.error) || '无法读取卡片信息')}</div>`;
+      body.innerHTML = `<div class="dlg-empty">${esc((info && info.error) || t('cf.loadFailed'))}</div>`;
       return;
     }
     body.innerHTML = cardFormHtml(info);
@@ -3503,7 +3640,7 @@
         // 先切忙碌样式：即使其它标签页正在翻译，也立即反馈「正在翻译标签中...」并排队等待
         btn.classList.add('busy');
         if (spinner) spinner.hidden = false;
-        if (label) label.textContent = '正在翻译标签中...';
+        if (label) label.textContent = t('cf.translating');
         if (zhTime) { zhTime.textContent = ''; zhTime.classList.remove('is-err'); }
         const t0 = performance.now();
         const before = body.querySelectorAll('.lna-tag.has-zh').length;
@@ -3529,28 +3666,28 @@
               zhTime.textContent = body.__lnaZhNote;
               zhTime.classList.add('is-err');
             } else {
-              zhTime.textContent = `上次用时 ${secs} 秒`;
+              zhTime.textContent = t('cf.lastTook', { secs });
             }
           }
         } else if (zhTime) {
-          zhTime.textContent = '翻译失败';
+          zhTime.textContent = t('cf.translateFailed');
           zhTime.classList.add('is-err');
         }
       });
     }
 
-    bindZhButton(zhAll, '.lna-zh-all-label', '翻译所有标签',
-      () => tagList, '该模型没有训练标签');
+    bindZhButton(zhAll, '.lna-zh-all-label', t('cf.translateAllLabel'),
+      () => tagList, t('cf.noTagsMsg'));
     // 只提交当前显示为「未完成翻译」的标签：词典/缓存已命中的不再重复送模型
-    bindZhButton(body.querySelector('.lna-cf-zh-missing'), '.lna-zh-missing-label', '翻译未完成标签',
+    bindZhButton(body.querySelector('.lna-cf-zh-missing'), '.lna-zh-missing-label', t('cf.translateMissingLabel'),
       () => Array.from(body.querySelectorAll('.lna-tag.no-zh')).map((el) => el.dataset.tag),
-      '没有未完成的标签');
+      t('cf.noMissingMsg'));
 
     // 选择标签重新翻译：打开嵌套小弹窗勾选后重翻
     const zhPick = body.querySelector('.lna-cf-zh-pick');
     if (zhPick) {
       zhPick.addEventListener('click', () => {
-        if (body.__lnaZhPromise) { flashToast('正在翻译中，暂时无法操作', true); return; }
+        if (body.__lnaZhPromise) { flashToast(t('toast.translating'), true); return; }
         openRepickDialog(body, info, l);
       });
     }
@@ -3559,7 +3696,7 @@
     const dictBtn = body.querySelector('.lna-cf-dict');
     if (dictBtn) {
       dictBtn.addEventListener('click', () => {
-        if (body.__lnaZhPromise) { flashToast('正在翻译中，暂时无法操作', true); return; }
+        if (body.__lnaZhPromise) { flashToast(t('toast.translating'), true); return; }
         openDictDialog(body, info);
       });
     }
@@ -3568,7 +3705,7 @@
     const editZhBtn = body.querySelector('.lna-cf-zh-edit');
     if (editZhBtn) {
       editZhBtn.addEventListener('click', () => {
-        if (body.__lnaZhPromise) { flashToast('正在翻译中，暂时无法操作', true); return; }
+        if (body.__lnaZhPromise) { flashToast(t('toast.translating'), true); return; }
         openManualTranslateDialog(body, info, l.rel);
       });
     }
@@ -3615,12 +3752,12 @@
           l.preview = res.preview;
           l.preview_ver = res.preview_ver;
           renderAll(); // 同步卡片缩略图
-          flashToast('预览图已替换');
+          flashToast(t('cf.previewReplaced'));
         } else {
-          flashToast('替换失败：' + ((res && res.error) || '未知错误'));
+          flashToast(t('toast.replaceFailed', { msg: (res && res.error) || t('toast.unknownError') }));
         }
       } catch (e) {
-        flashToast('替换失败：请求出错');
+        flashToast(t('toast.replaceFailedReq'));
       }
       fileInput.value = '';
     });
@@ -3636,22 +3773,22 @@
       <div class="lna-cf-top">
         <div class="lna-cf-top-main">
           <label class="lna-cf-field">
-            <span class="lna-cf-label">描述</span>
+            <span class="lna-cf-label">${t('cf.description')}</span>
             <textarea class="lna-cf-input lna-cf-desc" rows="4">${esc(info.description || '')}</textarea>
           </label>
           <dl class="lna-cf-info">
-            <dt>名称</dt><dd>${esc(info.name)}</dd>
-            <dt>相对路径</dt><dd>${esc(info.rel || '（根目录）')}</dd>
-            <dt>模型个数<span class="lna-cf-hint">含子文件夹</span></dt><dd>${esc(String(info.count))}</dd>
+            <dt>${t('folder.name')}</dt><dd>${esc(info.name)}</dd>
+            <dt>${t('folder.relPath')}</dt><dd>${esc(info.rel || t('folder.rootDir'))}</dd>
+            <dt>${t('folder.count')}<span class="lna-cf-hint">${t('folder.countHint')}</span></dt><dd>${esc(String(info.count))}</dd>
           </dl>
         </div>
         <div class="lna-cf-top-side">
           <div class="lna-cf-preview${info.preview ? '' : ' is-empty'}"${coverStyle}>
-            <span class="lna-cf-preview-hint">暂无预览图</span>
+            <span class="lna-cf-preview-hint">${t('cf.previewHint')}</span>
           </div>
-          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">浏览并替换预览图像</button>
-          <button class="dlg-btn dlg-action lna-cf-use-gen" type="button" data-act="use-generated">将生成的图像作为预览图像</button>
-          <button class="dlg-btn dlg-action lna-cf-open" type="button" data-act="open-folder">打开文件夹路径</button>
+          <button class="dlg-btn dlg-action lna-cf-replace" type="button" data-act="replace">${t('cf.replacePreview')}</button>
+          <button class="dlg-btn dlg-action lna-cf-use-gen" type="button" data-act="use-generated">${t('cf.useGenerated')}</button>
+          <button class="dlg-btn dlg-action lna-cf-open" type="button" data-act="open-folder">${t('folder.openPath')}</button>
         </div>
       </div>
     </div>`;
@@ -3660,19 +3797,19 @@
   async function openFolderCardSettings(f) {
     let fileInput = null;
     const dlg = openModal({
-      title: `卡片设置 · ${f.name}`,
+      title: t('cf.title', { name: f.name }),
       locked: true,
       bodyHtml: `<div class="dlg-loading" role="status" aria-live="polite">
-        <span class="lna-spinner" aria-hidden="true"></span>正在读取文件夹信息…</div>`,
-      footerHtml: `<button class="dlg-btn dlg-cancel" data-act="cancel" type="button">取消</button>
-        <button class="dlg-btn primary" data-act="save" type="button">保存</button>`,
+        <span class="lna-spinner" aria-hidden="true"></span>${t('folder.loading')}</div>`,
+      footerHtml: `<button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('cf.cancel')}</button>
+        <button class="dlg-btn primary" data-act="save" type="button">${t('settings.save')}</button>`,
       onOpen(modal) {
         modal.querySelector('[data-act="cancel"]').addEventListener('click', () => closeModal(modal));
 
         // 替换按钮/打开按钮在内容区、异步渲染后才出现，故用事件委托
         modal.addEventListener('click', (e) => {
           if (e.target.closest('[data-act="replace"]')) {
-            if (!fileInput) { flashToast('文件夹信息还在加载，请稍候'); return; }
+            if (!fileInput) { flashToast(t('toast.folderLoading')); return; }
             fileInput.click();
             return;
           }
@@ -3686,14 +3823,14 @@
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ rel: f.rel }),
             }).then((r) => r.json()).then((res) => {
-              if (!res || !res.ok) flashToast('打开失败：' + ((res && res.error) || '未知错误'));
-            }).catch(() => flashToast('打开失败：请求出错'));
+              if (!res || !res.ok) flashToast(t('toast.openFailed', { msg: (res && res.error) || t('toast.unknownError') }));
+            }).catch(() => flashToast(t('toast.openFailedReq')));
           }
         });
 
         modal.querySelector('[data-act="save"]').addEventListener('click', async () => {
           const desc = modal.querySelector('.lna-cf-desc');
-          if (!desc) { flashToast('文件夹信息还在加载，请稍候'); return; }
+          if (!desc) { flashToast(t('toast.folderLoading')); return; }
           try {
             const r = await fetch(API.userMeta, {
               method: 'POST',
@@ -3701,10 +3838,10 @@
               body: JSON.stringify({ rel: f.rel, description: desc.value }),
             });
             const res = await r.json();
-            if (res && res.ok) { closeModal(modal); flashToast('已保存文件夹设置'); }
-            else flashToast('保存失败：' + ((res && res.error) || '未知错误'));
+            if (res && res.ok) { closeModal(modal); flashToast(t('toast.folderSaved')); }
+            else flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }));
           } catch (e) {
-            flashToast('保存失败：请求出错');
+            flashToast(t('toast.saveFailedReq'));
           }
         });
       },
@@ -3716,11 +3853,11 @@
       const r = await fetch(`${API.folderInfo}?rel=${encodeURIComponent(f.rel)}`);
       info = await r.json();
     } catch (e) {
-      info = { ok: false, error: '读取请求失败' };
+      info = { ok: false, error: t('toast.readReqFailed') };
     }
     if (!document.contains(dlg)) return; // 弹窗已被关闭
     if (!info || !info.ok) {
-      body.innerHTML = `<div class="dlg-empty">${esc((info && info.error) || '无法读取文件夹信息')}</div>`;
+      body.innerHTML = `<div class="dlg-empty">${esc((info && info.error) || t('folder.loadFailed'))}</div>`;
       return;
     }
     body.innerHTML = folderFormHtml(info);
@@ -3749,12 +3886,12 @@
           f.preview = res.preview;
           f.preview_ver = res.preview_ver;
           renderAll(); // 同步文件夹卡片封面
-          flashToast('预览图已替换');
+          flashToast(t('cf.previewReplaced'));
         } else {
-          flashToast('替换失败：' + ((res && res.error) || '未知错误'));
+          flashToast(t('toast.replaceFailed', { msg: (res && res.error) || t('toast.unknownError') }));
         }
       } catch (e) {
-        flashToast('替换失败：请求出错');
+        flashToast(t('toast.replaceFailedReq'));
       }
       fileInput.value = '';
     });
@@ -3778,13 +3915,13 @@
       if (str.length <= META_BOX_MIN && !str.includes('\n')) return esc(str);
       text = str;
     }
-    if (text.length > META_VALUE_LIMIT) text = text.slice(0, META_VALUE_LIMIT) + '\n…（内容过长，已截断）';
+    if (text.length > META_VALUE_LIMIT) text = text.slice(0, META_VALUE_LIMIT) + t('meta.truncated');
     return `<pre class="lna-meta-json">${esc(text)}</pre>`;
   }
 
   function renderMetaTable(meta) {
     const keys = Object.keys(meta || {});
-    if (!keys.length) return `<div class="dlg-empty">此模型未包含内部元数据</div>`;
+    if (!keys.length) return `<div class="dlg-empty">${t('meta.empty')}</div>`;
     keys.sort((a, b) => (META_ORDER[a] || 999) - (META_ORDER[b] || 999)); // 稳定排序，其余保持原顺序
     const rows = keys.map((k) => `<dt>${esc(k)}</dt><dd>${fmtMetaValue(meta[k])}</dd>`).join('');
     return `<dl class="lna-meta-list">${rows}</dl>`;
@@ -3792,11 +3929,11 @@
 
   async function openLoraMetadata(l) {
     const dlg = openModal({
-      title: `${l.name} · 内部元数据`,
+      title: t('meta.title', { name: l.name }),
       locked: true,
       bodyHtml: `<div class="dlg-loading" role="status" aria-live="polite">
-        <span class="lna-spinner" aria-hidden="true"></span>正在读取内部元数据…</div>`,
-      footerHtml: `<button class="dlg-btn dlg-cancel" data-act="close" type="button">关闭</button>`,
+        <span class="lna-spinner" aria-hidden="true"></span>${t('meta.loading')}</div>`,
+      footerHtml: `<button class="dlg-btn dlg-cancel" data-act="close" type="button">${t('settings.close')}</button>`,
       onOpen(modal) {
         modal.querySelector('[data-act="close"]').addEventListener('click', () => closeModal(modal));
       },
@@ -3807,12 +3944,12 @@
       const r = await fetch(`${API.metadata}?rel=${encodeURIComponent(l.rel)}`);
       res = await r.json();
     } catch (e) {
-      res = { ok: false, error: '读取请求失败' };
+      res = { ok: false, error: t('toast.readReqFailed') };
     }
     if (!document.contains(dlg)) return; // 弹窗已被关闭，丢弃结果
     body.innerHTML = res && res.ok
       ? renderMetaTable(res.metadata)
-      : `<div class="dlg-empty">${esc((res && res.error) || '无法读取内部元数据')}</div>`;
+      : `<div class="dlg-empty">${esc((res && res.error) || t('meta.loadFailed'))}</div>`;
   }
 
   async function useLora(l) {
@@ -3840,14 +3977,14 @@
     if (negativeToAdd) appendToPromptBox(`#${prefix}_neg_prompt`, negativeToAdd);
     const tabName = isImg2Img ? 'img2img' : 'txt2img';
     flashToast(negativeToAdd
-      ? `已添加 ${l.name} 到${tabName}正/负提示词`
-      : `已添加到${tabName}正提示词：${l.name}`);
+      ? t('useLora.addedBoth', { name: l.name, tab: tabName })
+      : t('useLora.addedPositive', { tab: tabName, name: l.name }));
   }
 
   function appendToPromptBox(selector, text) {
     const box = document.querySelector(selector);
     if (!box) {
-      flashToast('找不到提示词输入框');
+      flashToast(t('toast.promptBoxNotFound'));
       return;
     }
     const ta = box.querySelector('textarea');
@@ -3881,7 +4018,7 @@
     dlg.innerHTML = `
       <header>
         <span class="dlg-title" id="lna-dlg-title">${esc(title)}</span>
-        <button class="dlg-close" type="button" aria-label="关闭对话框">${ICON.close}</button>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">${bodyHtml}</div>
       ${footerHtml ? `<div class="dlg-footer">${footerHtml}</div>` : ''}
@@ -3919,7 +4056,7 @@
     if (groups.length < 2) return; // 少于两个分组时不显示导航，其余小弹窗不受影响
     const nav = document.createElement('nav');
     nav.className = 'dlg-nav';
-    nav.setAttribute('aria-label', '设置分组导航');
+    nav.setAttribute('aria-label', t('common.setNavAria'));
     const items = groups.map((g) => {
       const titleEl = g.querySelector('.lna-set-group-title');
       const b = document.createElement('button');
@@ -4084,7 +4221,7 @@
     e.preventDefault();
     const closeBtn = mask.querySelector('.dlg-close');
     if (closeBtn && closeBtn.classList.contains('lna-dlg-blocked')) {
-      flashToast('正在翻译中，暂时无法操作', true); // 与按钮拦截提示保持一致
+      flashToast(t('toast.translating'), true); // 与按钮拦截提示保持一致
       return;
     }
     const now = Date.now();
@@ -4103,11 +4240,11 @@
     box.className = 'lna-lightbox';
     box.setAttribute('role', 'dialog');
     box.setAttribute('aria-modal', 'true');
-    box.setAttribute('aria-label', `预览大图：${name}`);
+    box.setAttribute('aria-label', t('lightbox.aria', { name }));
     box.innerHTML = `
       <div class="lna-lightbox-stage"><img class="lna-lightbox-img" src="${esc(src)}" alt="${esc(name)}" draggable="false"></div>
-      <button class="lna-lightbox-close" type="button" aria-label="关闭预览">${ICON.close}</button>
-      <div class="lna-lightbox-hint" aria-hidden="true">滚轮缩放 · 拖拽移动 · WASD 移动 · Esc 关闭</div>`;
+      <button class="lna-lightbox-close" type="button" aria-label="${esc(t('lightbox.closeAria'))}">${ICON.close}</button>
+      <div class="lna-lightbox-hint" aria-hidden="true">${t('lightbox.hint')}</div>`;
     document.body.appendChild(box);
     lockScroll();
     const prevFocus = document.activeElement; // 关闭后把焦点还给预览图
@@ -4212,8 +4349,8 @@
     if (pv.classList.contains('is-empty')) return; // 无预览图：保持纯占位，不设可聚焦/提示
     pv.setAttribute('role', 'button');
     pv.setAttribute('tabindex', '0');
-    pv.setAttribute('aria-label', `预览大图：${name}`);
-    pv.title = '点击预览大图';
+    pv.setAttribute('aria-label', t('lightbox.aria', { name }));
+    pv.title = t('lightbox.openTitle');
     pv.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
     });
@@ -4241,7 +4378,9 @@
 
   // ---------- 启动 ----------
   async function init() {
+    ensureLocalizationGuard(); // 尽早屏蔽 Forge 全局本地化对本插件节点的改写
     state.expandedFolders = loadExpandedFolders(); // 恢复已记忆的展开状态
+    await loadI18n();     // 先取界面语言包，再渲染，避免首屏出现 key 文本
     await loadSettings(); // 恢复排序方式 / 插件设置开关（读插件目录的 ui_settings.json）
     await loadTree();
     await loadDir('');

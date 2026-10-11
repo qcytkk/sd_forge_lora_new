@@ -1099,10 +1099,11 @@ body.dark .lna-dialog .lna-size-field { color: #9ca3af; }
 body.dark .lna-dialog .lna-size-input { border-color: #374151; background: #1f2937; color: #f3f4f6; }
 
 /* ---------- 标签翻译设置：模型下拉 + 下载区 ---------- */
-/* 下拉框统一样式：GGUF 模型 / 待下载文件 / 翻译提示预设 */
+/* 下拉框统一样式：GGUF 模型 / 待下载文件 / 翻译提示预设 / 界面语言 */
 .lna-dialog .lna-llm-select,
 .lna-dialog .lna-llm-file,
-.lna-dialog .lna-prompt-select {
+.lna-dialog .lna-prompt-select,
+.lna-dialog .lna-lang-select {
   box-sizing: border-box;
   height: 28px;
   max-width: 320px;
@@ -1116,8 +1117,10 @@ body.dark .lna-dialog .lna-size-input { border-color: #374151; background: #1f29
 }
 body.dark .lna-dialog .lna-llm-select,
 body.dark .lna-dialog .lna-llm-file,
-body.dark .lna-dialog .lna-prompt-select { border-color: #374151; background: #1f2937; color: #f3f4f6; }
-.lna-dialog .lna-prompt-select:focus {
+body.dark .lna-dialog .lna-prompt-select,
+body.dark .lna-dialog .lna-lang-select { border-color: #374151; background: #1f2937; color: #f3f4f6; }
+.lna-dialog .lna-prompt-select:focus,
+.lna-dialog .lna-lang-select:focus {
   outline: none;
   border-color: #ea580c;
   box-shadow: 0 0 0 1px #ea580c;

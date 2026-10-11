@@ -23,6 +23,20 @@ from fastapi.staticfiles import StaticFiles
 
 from modules import paths, script_callbacks
 
+# ---------- 界面多语言（i18n） ----------
+# 语言包与实现位于插件根目录的 lna_i18n 包（顶层可导入，与 lna_lora_engine 同机制）。
+# 导入失败时 _i18n 为 None，_t() 退化为原样返回 key，界面回落为 key 文本，不影响功能。
+try:
+    from lna_i18n import core as _i18n
+except Exception:
+    _i18n = None
+
+
+def _t(key: str, **vars) -> str:
+    """后端文案多语言取值（实现见 lna_i18n.t）。"""
+    return _i18n.t(key, **vars) if _i18n is not None else key
+
+
 # ---------- 路径 ----------
 EXT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = EXT_DIR / "data"
@@ -130,6 +144,7 @@ UI_SETTINGS_KEYS: dict[str, type] = {
     "cardHeight": int,
     "sidebarWidth": int,
     "bodyHeight": int,
+    "uiLang": str,          # 界面语言代码（如 zh_CN / en_US），见 lna_i18n
 }
 _ui_settings: dict[str, Any] = {}
 _ui_settings_lock = threading.RLock()
@@ -179,6 +194,10 @@ def _update_ui_settings(patch: dict) -> dict:
 
 
 _load_ui_settings()
+
+# 界面语言：以持久化的 uiLang 为准初始化（缺失或非法时回落默认 zh_CN）
+if _i18n is not None:
+    _i18n.set_lang(_ui_settings.get("uiLang") or "")
 
 
 # ---------- 文件扫描 ----------
@@ -393,12 +412,12 @@ def read_lora_metadata(rel: str) -> dict:
     """
     safe = _safe_rel(rel)
     if not safe:
-        return {"ok": False, "error": "无效的文件路径"}
+        return {"ok": False, "error": _t("err.invalidPath")}
     path = LORA_DIR / safe
     if not path.is_file() or path.suffix.lower() not in LORA_EXTS:
-        return {"ok": False, "error": "文件不存在"}
+        return {"ok": False, "error": _t("err.fileNotFound")}
     if path.suffix.lower() != ".safetensors":
-        return {"ok": False, "error": "仅 .safetensors 支持读取内部元数据"}
+        return {"ok": False, "error": _t("err.safetensorsOnly")}
     try:
         # 延迟导入，避免扩展加载时引入 sd_models 的重依赖
         from modules import cache, sd_models
@@ -410,7 +429,7 @@ def read_lora_metadata(rel: str) -> dict:
             "safetensors-metadata", "lora_new/" + safe, str(path), _read
         ) or {}
     except Exception as e:
-        return {"ok": False, "error": f"读取失败：{e}"}
+        return {"ok": False, "error": _t("err.readFailed", msg=e)}
 
     # 与内置实现一致：封面字段过大，不适合在 UI 中以文本展示
     meta = {k: v for k, v in meta.items() if k != "ssmd_cover_images"}
@@ -497,14 +516,14 @@ def card_info(rel: str) -> dict:
     """卡片设置弹窗所需的全部数据：文件信息、元数据表、训练标签、用户元数据。"""
     safe = _safe_rel(rel)
     if not safe:
-        return {"ok": False, "error": "无效的文件路径"}
+        return {"ok": False, "error": _t("err.invalidPath")}
     path = LORA_DIR / safe
     if not path.is_file() or path.suffix.lower() not in LORA_EXTS:
-        return {"ok": False, "error": "文件不存在"}
+        return {"ok": False, "error": _t("err.fileNotFound")}
     try:
         st = path.stat()
     except Exception:
-        return {"ok": False, "error": "无法读取文件信息"}
+        return {"ok": False, "error": _t("err.readFileInfo")}
 
     meta: dict = {}
     if path.suffix.lower() == ".safetensors":
@@ -520,16 +539,16 @@ def card_info(rel: str) -> dict:
     meta.pop("ssmd_cover_images", None)
 
     table: list[dict] = [
-        {"label": "文件名", "value": safe},
-        {"label": "文件大小", "value": _human_size(st.st_size)},
-        {"label": "哈希值", "value": _short_hash(path, safe, meta)},
-        {"label": "最后修改日期", "value": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))},
+        {"key": "filename", "label": _t("info.filename"), "value": safe},
+        {"key": "size", "label": _t("info.size"), "value": _human_size(st.st_size)},
+        {"key": "hash", "label": _t("info.hash"), "value": _short_hash(path, safe, meta)},
+        {"key": "modified", "label": _t("info.modified"), "value": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))},
     ]
     for key, label in (
-        ("ss_output_name", "输出名称"),
-        ("ss_sd_model_name", "模型"),
-        ("ss_clip_skip", "CLIP 终止层数"),
-        ("ss_network_module", "Kohya 模块类型"),
+        ("ss_output_name", _t("info.outputName")),
+        ("ss_sd_model_name", _t("info.model")),
+        ("ss_clip_skip", _t("info.clipSkip")),
+        ("ss_network_module", _t("info.kohyaModule")),
     ):
         val = meta.get(key)
         if val is not None and str(val) != "None":
@@ -539,7 +558,7 @@ def card_info(rel: str) -> dict:
     if started:
         try:
             table.append({
-                "label": "训练日期",
+                "label": _t("info.trainDate"),
                 "value": time.strftime("%Y-%m-%d %H:%M", time.localtime(float(started))),
             })
         except Exception:
@@ -558,7 +577,7 @@ def card_info(rel: str) -> dict:
         if res:
             ordered = sorted(res, key=res.get, reverse=True)
             table.append({
-                "label": "分辨率",
+                "label": _t("info.resolution"),
                 "value": ", ".join(ordered[:4]) + (", ..." if len(ordered) > 4 else ""),
                 "title": ", ".join(ordered),
             })
@@ -572,14 +591,14 @@ def card_info(rel: str) -> dict:
             except Exception:
                 continue
     if img_count:
-        table.append({"label": "数据集大小", "value": str(img_count)})
+        table.append({"label": _t("info.datasetSize"), "value": str(img_count)})
 
     tags = build_tags(meta)[:24]
     # 卡片资料改从 models_json_data 的镜像 JSON 读取；首次访问时补齐重定向锚点
     user = _get_card_data(safe)
     if not user.get("hash") or not user.get("size"):
         if not user.get("hash"):
-            hash_row = next((r for r in table if r.get("label") == "哈希值"), None)
+            hash_row = next((r for r in table if r.get("key") == "hash"), None)
             user["hash"] = hash_row["value"] if hash_row else ""
         user["size"] = st.st_size
         user["tags"] = [[t, c] for t, c in tags]
@@ -607,7 +626,7 @@ def folder_info(rel: str) -> dict:
     safe = _safe_rel(rel)
     abs_dir = (LORA_DIR / safe) if safe else LORA_DIR
     if not abs_dir.is_dir():
-        return {"ok": False, "error": "文件夹不存在"}
+        return {"ok": False, "error": _t("err.folderNotFound")}
     pv = _find_folder_preview(abs_dir)
     return {
         "ok": True,
@@ -736,7 +755,7 @@ def _dict_upsert(tag: str, value: str) -> dict:
     key = _normalize_tag(tag)
     val = " ".join(str(value or "").split())
     if not key or not val:
-        return {"ok": False, "error": "标签或译文为空"}
+        return {"ok": False, "error": _t("err.tagOrZhEmpty")}
     with _dict_lock:
         rows: list[list[str]] = []
         try:
@@ -744,7 +763,7 @@ def _dict_upsert(tag: str, value: str) -> dict:
                 with DICT_FILE.open("r", encoding="utf-8", errors="ignore", newline="") as f:
                     rows = [r for r in csv.reader(f) if r]
         except Exception as e:
-            return {"ok": False, "error": f"读取词典失败：{e}"}
+            return {"ok": False, "error": _t("err.readDictFailed", msg=e)}
         replaced = False
         for r in rows:
             if r and _normalize_tag(r[0]) == key:
@@ -766,7 +785,7 @@ def _dict_upsert(tag: str, value: str) -> dict:
                     tmp.unlink()
             except Exception:
                 pass
-            return {"ok": False, "error": f"写入词典失败：{e}"}
+            return {"ok": False, "error": _t("err.writeDictFailed", msg=e)}
         _tag_dict[key] = val  # 内存同步，立即对翻译生效
         return {"ok": True, "key": key, "value": val, "replaced": replaced}
 
@@ -999,7 +1018,7 @@ def _get_llm():
         return None
     path = _resolve_llm_path(rel)
     if path is None or not path.is_file():
-        _llm_load_error = "模型文件不存在，请在「标签翻译设置」中重新选择"
+        _llm_load_error = _t("llm.status.modelMissing")
         return None
     with _llm_lock:
         if _llm is not None and _llm_path == str(path):
@@ -1026,7 +1045,7 @@ def _get_llm():
         except Exception as e:
             _llm = None
             _llm_path = ""
-            _llm_load_error = f"加载失败：{e}"
+            _llm_load_error = _t("llm.status.loadFailed", msg=e)
             # GPU 加载失败（如显存被 SD 占满）时自动降级重试一次 CPU
             if use_gpu:
                 try:
@@ -1041,11 +1060,11 @@ def _get_llm():
                     )
                     _llm_path = str(path)
                     _llm_last_used = time.time()
-                    _llm_load_error = "显存不足，本次已自动改用 CPU"
+                    _llm_load_error = _t("llm.status.vramFallback")
                 except Exception as e2:
                     _llm = None
                     _llm_path = ""
-                    _llm_load_error = f"加载失败：{e2}"
+                    _llm_load_error = _t("llm.status.loadFailed", msg=e2)
             return None
         return _llm
 
@@ -1142,7 +1161,7 @@ def _llm_translate_batch(tags: list[str]) -> dict[str, str]:
             )
             text = out["choices"][0]["message"]["content"]
         except Exception as e:
-            _llm_load_error = f"推理失败：{e}"
+            _llm_load_error = _t("llm.status.inferFailed", msg=e)
             _llm_last_used = time.time()  # 失败也算使用过，避免立刻被卸载后马上重试
             return {}
         _llm_last_used = time.time()  # 推理完成：刷新空闲计时起点
@@ -1161,9 +1180,9 @@ def _llm_translate_batch(tags: list[str]) -> dict[str, str]:
         # 模型确实跑完了但没给出可用译文：区分「没解析出 JSON」与「键名对不上」，
         # 否则上层只会看到空结果，无法定位是提示预设内容有问题
         _llm_last_note = (
-            "模型未返回可解析的 JSON，请检查「翻译提示预设」内容"
+            _t("llm.status.noJson")
             if not data else
-            "模型返回的标签名与原文对不上，请检查「翻译提示预设」内容"
+            _t("llm.status.tagMismatch")
         )
     return result
 
@@ -1246,7 +1265,7 @@ def translate_tags(tags: list[str], force: bool = False) -> dict:
         got = _llm_translate_batch(pending)
         if not got:
             # 优先用「模型跑了但没产出可用译文」的具体原因，其次才是模型不可用
-            engine_note = _llm_last_note or _llm_load_error or "未启用 GGUF 模型"
+            engine_note = _llm_last_note or _llm_load_error or _t("llm.status.notEnabled")
         for tag, zh in got.items():
             if zh and zh != tag:          # 与原文相同视为「没翻出来」，不写缓存
                 translations[tag] = zh
@@ -1389,13 +1408,13 @@ def _download_worker(repo: str, filename: str) -> None:
                 continue  # 断流：保留 .part，下一轮从断点继续
             size = tmp.stat().st_size if tmp.exists() else 0
             if total and size < total:
-                last_err = f"数据不完整（{size}/{total} 字节）"
+                last_err = _t("dl.incomplete", size=size, total=total)
                 continue
             tmp.replace(dest)  # 完整落盘后才改名，避免半成品被当成可用模型
             with _download_lock:
                 _download_state.update(active=False, ok=True, error="")
             return
-        raise RuntimeError(last_err or "多次重试后仍未完成")
+        raise RuntimeError(last_err or _t("dl.retryExhausted"))
     except Exception as e:
         try:
             if tmp.exists():
@@ -1403,7 +1422,7 @@ def _download_worker(repo: str, filename: str) -> None:
         except Exception:
             pass
         with _download_lock:
-            _download_state.update(active=False, ok=False, error=f"下载失败：{e}")
+            _download_state.update(active=False, ok=False, error=_t("dl.failed", msg=e))
 
 
 # ---------- 翻译运行时的构建探测与 CUDA 轮子下载 ----------
@@ -1573,7 +1592,7 @@ def _cuda_wheel_worker() -> None:
                 if e.code == 416 and tmp.exists():
                     # 断点位置超出远端文件（远端变小或换了文件）→ 丢掉半成品重来
                     tmp.unlink()
-                    last_err = "断点已失效，重新开始下载"
+                    last_err = _t("dl.resumeInvalid")
                     continue
                 last_err = f"{e}"
                 continue  # 断流：保留 .part，下一轮从断点继续
@@ -1583,7 +1602,7 @@ def _cuda_wheel_worker() -> None:
             size = tmp.stat().st_size if tmp.exists() else 0
             expected = remote_size or total
             if expected and size != expected:
-                last_err = f"数据不完整（{size}/{expected} 字节）"
+                last_err = _t("dl.incomplete", size=size, total=expected)
                 continue
             tmp.replace(dest)  # 完整落盘后才改名，避免半成品被当成可用轮子
             with _runtime_dl_lock:
@@ -1597,7 +1616,7 @@ def _cuda_wheel_worker() -> None:
             with _runtime_dl_lock:
                 _runtime_dl_state.update(active=False, ok=True, error="")
             return
-        raise RuntimeError(last_err or "多次重试后仍未完成")
+        raise RuntimeError(last_err or _t("dl.retryExhausted"))
     except Exception as e:
         # 保留 .part：下次点按钮可从断点续传，不必重下整个文件
         kept = 0
@@ -1605,9 +1624,9 @@ def _cuda_wheel_worker() -> None:
             kept = tmp.stat().st_size if tmp.exists() else 0
         except Exception:
             kept = 0
-        hint = f"（已保留 {kept // 1048576} MB，下次将从断点继续）" if kept else ""
+        hint = _t("dl.resumeKept", mb=kept // 1048576) if kept else ""
         with _runtime_dl_lock:
-            _runtime_dl_state.update(active=False, ok=False, error=f"下载失败：{e}{hint}")
+            _runtime_dl_state.update(active=False, ok=False, error=_t("dl.failed", msg=f"{e}{hint}"))
 
 
 # ---------- 卡片设置资料 JSON（按模型镜像存储，文件名加 _new 后缀） ----------
@@ -2142,12 +2161,12 @@ def _merge_old_into_card(new_data: dict, old_card: dict) -> None:
 
 # 数据对比的字段与中文名（与卡片设置弹窗、旧插件 JSON 字段一一对应）
 COMPARE_FIELDS = (
-    ("description", "描述"),
-    ("base_model", "基础模型"),
-    ("activation_text", "触发词"),
-    ("preferred_weight", "推荐权重"),
-    ("negative_text", "反向提示词"),
-    ("notes", "注意事项"),
+    ("description", _t("cf.description")),
+    ("base_model", _t("cf.baseModel")),
+    ("activation_text", _t("cf.activation")),
+    ("preferred_weight", _t("cf.weight")),
+    ("negative_text", _t("cf.negative")),
+    ("notes", _t("cf.notes")),
 )
 
 
@@ -2242,16 +2261,16 @@ def overwrite_from_old_json(rel: str) -> dict:
     """冲突处理：用旧插件 JSON 的用户字段覆盖本插件镜像 JSON 的对应字段。"""
     safe = _safe_rel(rel)
     if not safe:
-        return {"ok": False, "error": "无效的文件路径"}
+        return {"ok": False, "error": _t("err.invalidPath")}
     jp = _old_json_path(safe)
     if jp is None or not jp.is_file():
-        return {"ok": False, "error": "未找到对应的旧 JSON"}
+        return {"ok": False, "error": _t("err.oldJsonNotFound")}
     try:
         old = json.loads(jp.read_text(encoding="utf-8"))
     except Exception as e:
-        return {"ok": False, "error": f"读取旧 JSON 失败：{e}"}
+        return {"ok": False, "error": _t("err.readOldJsonFailed", msg=e)}
     if not isinstance(old, dict):
-        return {"ok": False, "error": "旧 JSON 格式不正确"}
+        return {"ok": False, "error": _t("err.badOldJson")}
     old_card = _old_json_to_card(old)
     with _json_lock:
         new_data = _load_card_json(safe)
@@ -2265,7 +2284,7 @@ def overwrite_from_old_json(rel: str) -> dict:
             except Exception:
                 pass
         if not _save_card_json(safe, new_data):
-            return {"ok": False, "error": "写入 JSON 失败"}
+            return {"ok": False, "error": _t("err.writeJsonFailed")}
     return {"ok": True}
 
 
@@ -2277,20 +2296,20 @@ def unify_old_json_field(rel: str, key: str, direction: str) -> dict:
     """
     safe = _safe_rel(rel)
     if not safe:
-        return {"ok": False, "error": "无效的文件路径"}
+        return {"ok": False, "error": _t("err.invalidPath")}
     if key not in CARD_USER_KEYS:
-        return {"ok": False, "error": "不支持的字段"}
+        return {"ok": False, "error": _t("err.fieldUnsupported")}
     jp = _old_json_path(safe)
     if jp is None or not jp.is_file():
-        return {"ok": False, "error": "未找到对应的旧 JSON"}
+        return {"ok": False, "error": _t("err.oldJsonNotFound")}
 
     if direction == "old_to_new":
         try:
             old = json.loads(jp.read_text(encoding="utf-8"))
         except Exception as e:
-            return {"ok": False, "error": f"读取旧 JSON 失败：{e}"}
+            return {"ok": False, "error": _t("err.readOldJsonFailed", msg=e)}
         if not isinstance(old, dict):
-            return {"ok": False, "error": "旧 JSON 格式不正确"}
+            return {"ok": False, "error": _t("err.badOldJson")}
         val = _old_json_to_card(old).get(key)
         with _json_lock:
             new_data = _load_card_json(safe)
@@ -2303,7 +2322,7 @@ def unify_old_json_field(rel: str, key: str, direction: str) -> dict:
                 except Exception:
                     pass
             if not _save_card_json(safe, new_data):
-                return {"ok": False, "error": "写入本插件 JSON 失败"}
+                return {"ok": False, "error": _t("err.writePluginJsonFailed")}
         return {"ok": True, "key": key, "direction": direction}
 
     if direction == "new_to_old":
@@ -2331,20 +2350,20 @@ def unify_old_json_field(rel: str, key: str, direction: str) -> dict:
             tmp.write_text(json.dumps(old, ensure_ascii=False, indent=4), encoding="utf-8")
             tmp.replace(jp)
         except Exception as e:
-            return {"ok": False, "error": f"写入旧 JSON 失败：{e}"}
+            return {"ok": False, "error": _t("err.writeOldJsonFailed", msg=e)}
         return {"ok": True, "key": key, "direction": direction}
 
-    return {"ok": False, "error": "不支持的统一方向"}
+    return {"ok": False, "error": _t("err.badUnifyDirection")}
 
 
 # 数据对比弹窗的字段与中文名（与卡片设置弹窗、旧插件 JSON 字段一一对应）
 COMPARE_FIELDS = (
-    ("description", "描述"),
-    ("base_model", "基础模型"),
-    ("activation_text", "触发词"),
-    ("preferred_weight", "推荐权重"),
-    ("negative_text", "反向提示词"),
-    ("notes", "注意事项"),
+    ("description", _t("cf.description")),
+    ("base_model", _t("cf.baseModel")),
+    ("activation_text", _t("cf.activation")),
+    ("preferred_weight", _t("cf.weight")),
+    ("negative_text", _t("cf.negative")),
+    ("notes", _t("cf.notes")),
 )
 
 
@@ -2369,16 +2388,16 @@ def compare_old_json(rel: str) -> dict:
     """
     safe = _safe_rel(rel)
     if not safe:
-        return {"ok": False, "error": "无效的文件路径"}
+        return {"ok": False, "error": _t("err.invalidPath")}
     jp = _old_json_path(safe)
     if jp is None or not jp.is_file():
-        return {"ok": False, "error": "未找到对应的旧 JSON"}
+        return {"ok": False, "error": _t("err.oldJsonNotFound")}
     try:
         old = json.loads(jp.read_text(encoding="utf-8"))
     except Exception as e:
-        return {"ok": False, "error": f"读取旧 JSON 失败：{e}"}
+        return {"ok": False, "error": _t("err.readOldJsonFailed", msg=e)}
     if not isinstance(old, dict):
-        return {"ok": False, "error": "旧 JSON 格式不正确"}
+        return {"ok": False, "error": _t("err.badOldJson")}
     old_card = _old_json_to_card(old)
     new_data = _load_card_json(safe)
     if not isinstance(new_data, dict):
@@ -2424,7 +2443,7 @@ def _open_in_explorer(abs_dir: Path) -> str | None:
             opener = "open" if sys.platform == "darwin" else "xdg-open"
             subprocess.Popen([opener, str(abs_dir)])
     except Exception as e:
-        return f"打开失败：{e}"
+        return _t("err.openFailed", msg=e)
     return None
 
 
@@ -2439,7 +2458,7 @@ def _reveal_in_explorer(abs_path: Path) -> str | None:
         else:
             subprocess.Popen(["xdg-open", str(abs_path.parent)])
     except Exception as e:
-        return f"打开失败：{e}"
+        return _t("err.openFailed", msg=e)
     return None
 
 
@@ -2448,6 +2467,24 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         app.mount("/lora_new_files", StaticFiles(directory=str(LORA_DIR)), name="lora_new_files")
     _ensure_watchdog()  # 启动空闲自动卸载守护线程（只启动一次）
     _ensure_lora_engine()  # sd_forge_lora 未启用时自带 <lora:...> 引擎
+
+    # ---------- 界面多语言（i18n） ----------
+    @app.get("/lora_new/api/i18n")
+    def api_i18n():
+        """下发当前界面语言的语言包（前端唯一数据源）。"""
+        if _i18n is None:
+            return {"lang": "", "available": [], "dict": {}}
+        cur = _i18n.get_lang()
+        return {"lang": cur, "available": _i18n.available_langs(), "dict": _i18n.load_pack(cur)}
+
+    @app.post("/lora_new/api/ui_lang")
+    def api_ui_lang(payload: dict):
+        """切换界面语言：更新全局语言 + 持久化到 ui_settings，返回新语言包。"""
+        if _i18n is None:
+            return {"ok": False, "lang": "", "available": [], "dict": {}}
+        lang = _i18n.set_lang((payload or {}).get("lang", ""))
+        _update_ui_settings({"uiLang": lang})
+        return {"ok": True, "lang": lang, "available": _i18n.available_langs(), "dict": _i18n.load_pack(lang)}
 
     @app.get("/lora_new/api/tree")
     def api_tree():
@@ -2485,7 +2522,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         safe = _safe_rel(payload.get("rel", ""))
         abs_dir = (LORA_DIR / safe) if safe else LORA_DIR
         if not abs_dir.is_dir():
-            return {"ok": False, "error": "文件夹不存在"}
+            return {"ok": False, "error": _t("err.folderNotFound")}
         err = _open_in_explorer(abs_dir)
         if err:
             return {"ok": False, "error": err}
@@ -2496,10 +2533,10 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         """在资源管理器中打开模型所在文件夹，并自动选中该模型文件。"""
         safe = _safe_rel(payload.get("rel", ""))
         if not safe:
-            return {"ok": False, "error": "无效的文件路径"}
+            return {"ok": False, "error": _t("err.invalidPath")}
         abs_path = LORA_DIR / safe
         if not abs_path.is_file():
-            return {"ok": False, "error": "文件不存在"}
+            return {"ok": False, "error": _t("err.fileNotFound")}
         err = _reveal_in_explorer(abs_path)
         if err:
             return {"ok": False, "error": err}
@@ -2510,7 +2547,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         try:
             LLM_DIR.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            return {"ok": False, "error": f"模型目录不可用：{e}"}
+            return {"ok": False, "error": _t("err.modelDirUnavailable", msg=e)}
         err = _open_in_explorer(LLM_DIR)
         if err:
             return {"ok": False, "error": err}
@@ -2520,12 +2557,12 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     def api_translate(payload: dict):
         tags = payload.get("tags", [])
         if not isinstance(tags, list):
-            return {"ok": False, "error": "tags 必须是数组"}
+            return {"ok": False, "error": _t("err.tagsNotArray")}
         # 全局「翻译正在进行」标记：多个浏览器标签页共用同一后端，
         # 已有任务在跑时直接拒绝（busy=true），前端据此显示忙碌态并轮询等待
         with _translate_state_lock:
             if _translate_state["busy"]:
-                return {"ok": False, "busy": True, "error": "已有翻译任务在进行中"}
+                return {"ok": False, "busy": True, "error": _t("err.translateBusy")}
             _translate_state["busy"] = True
         try:
             # force=true（【翻译所有标签】按钮）：重跑流程并覆盖旧译文，不吃模型缓存
@@ -2561,7 +2598,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     def api_llm_gpu(payload: dict):
         want = bool(payload.get("gpu"))
         if want and not _cuda_available():
-            return {"ok": False, "error": "当前 llama_cpp 为 CPU 构建，不支持 GPU。需安装 CUDA 版 llama-cpp-python。"}
+            return {"ok": False, "error": _t("err.cpuBuildNoGpu")}
         if want == bool(_stats.get("llm_gpu")):
             return {"ok": True, "gpu": want}
         _stats["llm_gpu"] = want
@@ -2574,7 +2611,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         global _llm_load_error
         rel = str(payload.get("rel") or "")
         if rel and _resolve_llm_path(rel) is None:
-            return {"ok": False, "error": "无效的模型路径"}
+            return {"ok": False, "error": _t("err.invalidModelPath")}
         if str(_stats.get("llm_model") or "") != rel:
             _unload_llm()  # 换模型：立即释放旧实例
         _stats["llm_model"] = rel
@@ -2604,7 +2641,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     def api_translate_mode(payload: dict):
         mode = str((payload or {}).get("mode") or "")
         if mode not in TRANS_MODES:
-            return {"ok": False, "error": "无效的翻译方案"}
+            return {"ok": False, "error": _t("err.invalidTransMode")}
         _stats["translate_mode"] = mode
         _save_stats()
         return {"ok": True, "mode": mode}
@@ -2632,17 +2669,17 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         if action == "save":
             text = str(payload.get("text") or "")
             if not name:
-                return {"ok": False, "error": "请先填写预设名称"}
+                return {"ok": False, "error": _t("err.needPresetName")}
             if name == PROMPT_DEFAULT_NAME:
-                return {"ok": False, "error": "「默认」预设为内置内容，请换个名称保存"}
+                return {"ok": False, "error": _t("err.presetNameReserved")}
             if len(name) > PROMPT_NAME_MAX:
-                return {"ok": False, "error": f"预设名称不能超过 {PROMPT_NAME_MAX} 个字符"}
+                return {"ok": False, "error": _t("err.presetNameTooLong", n=PROMPT_NAME_MAX)}
             if not text.strip():
-                return {"ok": False, "error": "提示词不能为空"}
+                return {"ok": False, "error": _t("err.promptEmpty")}
             if len(text) > PROMPT_TEXT_MAX:
-                return {"ok": False, "error": f"提示词不能超过 {PROMPT_TEXT_MAX} 个字符"}
+                return {"ok": False, "error": _t("err.promptTooLong", n=PROMPT_TEXT_MAX)}
             if "{tags}" not in text:
-                return {"ok": False, "error": "提示词必须包含 {tags} 占位符，用于插入待翻译的标签列表"}
+                return {"ok": False, "error": _t("err.promptNeedPlaceholder")}
             presets = _stats.setdefault("prompt_presets", {})
             presets[name] = text
             _stats["active_prompt"] = name
@@ -2651,10 +2688,10 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
 
         if action == "delete":
             if name == PROMPT_DEFAULT_NAME:
-                return {"ok": False, "error": "「默认」预设为内置内容，不可删除"}
+                return {"ok": False, "error": _t("err.presetDefaultUndeletable")}
             presets = _stats.get("prompt_presets")
             if not isinstance(presets, dict) or name not in presets:
-                return {"ok": False, "error": "预设不存在"}
+                return {"ok": False, "error": _t("err.presetNotFound")}
             del presets[name]
             if str(_stats.get("active_prompt") or "") == name:
                 _stats["active_prompt"] = ""  # 删掉正在用的 → 回到默认预设
@@ -2663,21 +2700,21 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
 
         if action == "select":
             if name not in _prompt_presets():
-                return {"ok": False, "error": "预设不存在"}
+                return {"ok": False, "error": _t("err.presetNotFound")}
             _stats["active_prompt"] = name
             _save_stats()
             return _prompt_payload()
 
-        return {"ok": False, "error": "无效的操作"}
+        return {"ok": False, "error": _t("err.invalidAction")}
 
     @app.post("/lora_new/api/llm_repo_files")
     def api_llm_repo_files(payload: dict):
         repo = _normalize_repo(str(payload.get("repo") or ""))
         if not repo or "/" not in repo:
-            return {"ok": False, "error": "请填写 owner/name 形式的仓库或 HF 链接"}
+            return {"ok": False, "error": _t("err.repoFormat")}
         files = _hf_list_gguf(repo)
         if not files:
-            return {"ok": False, "error": "未找到 .gguf 文件（或网络不可用）", "repo": repo}
+            return {"ok": False, "error": _t("err.repoNoGguf"), "repo": repo}
         files.sort(key=lambda x: x["filename"])
         return {"ok": True, "repo": repo, "files": files,
                 "endpoint": _pick_hf_endpoint(), "dir": str(LLM_DIR)}
@@ -2687,12 +2724,12 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         repo = _normalize_repo(str(payload.get("repo") or ""))
         filename = str(payload.get("filename") or "")
         if not repo or "/" not in repo:
-            return {"ok": False, "error": "无效的仓库"}
+            return {"ok": False, "error": _t("err.invalidRepo")}
         if not filename.lower().endswith(".gguf") or ".." in filename:
-            return {"ok": False, "error": "无效的文件名"}
+            return {"ok": False, "error": _t("err.invalidFilename")}
         with _download_lock:
             if _download_state["active"]:
-                return {"ok": False, "error": "已有下载任务在进行中"}
+                return {"ok": False, "error": _t("err.downloadBusy")}
             _download_state.update(
                 active=True, ok=False, error="", filename=filename,
                 repo=repo, done=0, total=0, endpoint="",
@@ -2728,11 +2765,11 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         nv_ok, nv_ver = _nvidia_ok()
         if not nv_ok:
             min_ver = ".".join(str(x) for x in MIN_CUDA_DRIVER)
-            hint = f"（当前驱动 {nv_ver}）" if nv_ver else ""
-            return {"ok": False, "error": f"未检测到可用的 NVIDIA 显卡或驱动版本过低，需 ≥ {min_ver}{hint}"}
+            hint = _t("err.driverHint", v=nv_ver) if nv_ver else ""
+            return {"ok": False, "error": _t("err.noNvidia", min=min_ver, hint=hint)}
         with _runtime_dl_lock:
             if _runtime_dl_state["active"]:
-                return {"ok": False, "error": "已有下载任务在进行中"}
+                return {"ok": False, "error": _t("err.downloadBusy")}
             # done 从已有 .part 的大小起算：续传时进度条直接从中断处继续
             _runtime_dl_state.update(
                 active=True, ok=False, error="", done=_cuda_wheel_partial_size(), total=0, attempt=0,
@@ -2760,28 +2797,28 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         try:
             return match_old_data()
         except Exception as e:
-            return {"ok": False, "error": f"匹配失败：{e}"}
+            return {"ok": False, "error": _t("err.matchFailed", msg=e)}
 
     @app.post("/lora_new/api/sync_old_json")
     def api_sync_old_json():
         try:
             return sync_old_json()
         except Exception as e:
-            return {"ok": False, "error": f"同步失败：{e}"}
+            return {"ok": False, "error": _t("err.syncFailed", msg=e)}
 
     @app.post("/lora_new/api/sync_old_json_overwrite")
     async def api_sync_old_json_overwrite(payload: dict):
         try:
             return overwrite_from_old_json(payload.get("rel", ""))
         except Exception as e:
-            return {"ok": False, "error": f"覆盖失败：{e}"}
+            return {"ok": False, "error": _t("err.overwriteFailed", msg=e)}
 
     @app.post("/lora_new/api/sync_old_json_compare")
     async def api_sync_old_json_compare(payload: dict):
         try:
             return compare_old_json(payload.get("rel", ""))
         except Exception as e:
-            return {"ok": False, "error": f"对比失败：{e}"}
+            return {"ok": False, "error": _t("err.compareFailed", msg=e)}
 
     @app.post("/lora_new/api/sync_old_json_unify")
     async def api_sync_old_json_unify(payload: dict):
@@ -2790,13 +2827,13 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
                 payload.get("rel", ""), payload.get("key", ""), payload.get("direction", "")
             )
         except Exception as e:
-            return {"ok": False, "error": f"统一失败：{e}"}
+            return {"ok": False, "error": _t("err.unifyFailed", msg=e)}
 
     @app.post("/lora_new/api/user_metadata")
     async def api_user_metadata(payload: dict):
         rel = _safe_rel(payload.get("rel", ""))
         if not rel:
-            return {"ok": False, "error": "无效的文件路径"}
+            return {"ok": False, "error": _t("err.invalidPath")}
         try:
             weight = float(payload.get("preferred_weight", 0) or 0)
         except Exception:
@@ -2813,7 +2850,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             data["notes"] = str(payload.get("notes", ""))
             saved = _save_card_json(rel, data)
         if not saved:
-            return {"ok": False, "error": "写入 JSON 失败"}
+            return {"ok": False, "error": _t("err.writeJsonFailed")}
         # 同步清理旧存储中的遗留条目（迁移后不应再存在）
         if rel in _stats["user_metadata"]:
             _stats["user_metadata"].pop(rel, None)
@@ -2824,10 +2861,10 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     async def api_preview(rel: str = "", file: UploadFile = File(...)):
         safe = _safe_rel(rel)
         if not safe:
-            return {"ok": False, "error": "无效的文件路径"}
+            return {"ok": False, "error": _t("err.invalidPath")}
         path = LORA_DIR / safe
         if not path.is_file():
-            return {"ok": False, "error": "文件不存在"}
+            return {"ok": False, "error": _t("err.fileNotFound")}
         ctype = (file.content_type or "").lower()
         if "jpeg" in ctype or "jpg" in ctype:
             ext = ".jpg"
@@ -2838,7 +2875,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         try:
             data = await file.read()
             if not data:
-                return {"ok": False, "error": "上传的文件为空"}
+                return {"ok": False, "error": _t("err.emptyUpload")}
             # 「替换」语义：先清掉同名旧预览，保证新图成为唯一预览
             for old_ext in (".png", ".jpg", ".jpeg", ".webp"):
                 old = path.parent / (path.stem + old_ext)
@@ -2850,7 +2887,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             target = path.parent / (path.stem + ext)
             target.write_bytes(data)
         except Exception as e:
-            return {"ok": False, "error": f"写入失败：{e}"}
+            return {"ok": False, "error": _t("err.writeFailed", msg=e)}
         _stats["custom_previews"].pop(safe, None)
         _save_stats()
         rel_out = _rel(target)
@@ -2861,7 +2898,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         safe = _safe_rel(rel)
         abs_dir = (LORA_DIR / safe) if safe else LORA_DIR
         if not abs_dir.is_dir():
-            return {"ok": False, "error": "文件夹不存在"}
+            return {"ok": False, "error": _t("err.folderNotFound")}
         ctype = (file.content_type or "").lower()
         if "jpeg" in ctype or "jpg" in ctype:
             ext = ".jpg"
@@ -2872,7 +2909,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         try:
             data = await file.read()
             if not data:
-                return {"ok": False, "error": "上传的文件为空"}
+                return {"ok": False, "error": _t("err.emptyUpload")}
             # 「替换」语义：先清掉旧封面，保证新图成为唯一封面
             for old_ext in (".png", ".jpg", ".jpeg", ".webp"):
                 old = abs_dir / (FOLDER_COVER_STEM + old_ext)
@@ -2884,13 +2921,13 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             target = abs_dir / (FOLDER_COVER_STEM + ext)
             target.write_bytes(data)
         except Exception as e:
-            return {"ok": False, "error": f"写入失败：{e}"}
+            return {"ok": False, "error": _t("err.writeFailed", msg=e)}
         return {"ok": True, "preview": _rel(target), "preview_ver": _preview_ver(_rel(target))}
 
     @app.get("/lora_new/api/dict_lookup")
     def api_dict_lookup(tag: str = ""):
         if not tag.strip():
-            return {"ok": False, "error": "标签为空"}
+            return {"ok": False, "error": _t("err.tagEmpty")}
         return _dict_lookup(tag)
 
     @app.post("/lora_new/api/dict_upsert")
@@ -2903,7 +2940,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         供「将译文加入词典」弹窗判断标签该显示绿/黄橙/红。"""
         tags = payload.get("tags") or []
         if not isinstance(tags, list):
-            return {"ok": False, "error": "参数格式错误"}
+            return {"ok": False, "error": _t("err.badParams")}
         _load_tag_dict()
         result = {}
         for t in tags:
@@ -2928,9 +2965,9 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         tag = str(payload.get("tag") or "").strip()
         value = " ".join(str(payload.get("value") or "").split())
         if not rel:
-            return {"ok": False, "error": "无效的文件路径"}
+            return {"ok": False, "error": _t("err.invalidPath")}
         if not tag or not value:
-            return {"ok": False, "error": "标签或译文为空"}
+            return {"ok": False, "error": _t("err.tagOrZhEmpty")}
         # 随模型迁移：并入 translations.zh，供 card_info 读取显示
         _store_card_translations(rel, "zh", {tag: value})
         # 全局缓存按当前模型分桶：后续非强制的翻译直接复用人工译文
@@ -2980,7 +3017,7 @@ def _build_lora_new_page():
 
     class ExtraNetworksPageLoraNew(ui_extra_networks.ExtraNetworksPage):
         def __init__(self):
-            super().__init__("LoRA 管理器")
+            super().__init__(_t("page.title"))
             # title 是中文，派生出的 tab 名不可用；固定为 ASCII 以保证 elem_id 稳定
             self.name = LORA_NEW_TABNAME
             self.extra_networks_tabname = LORA_NEW_TABNAME
