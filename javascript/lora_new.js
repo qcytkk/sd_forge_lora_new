@@ -13,6 +13,7 @@
     search: '/lora_new/api/search',
     metadata: '/lora_new/api/metadata',
     cardInfo: '/lora_new/api/card_info',
+    modelTags: '/lora_new/api/model_tags',
     folderInfo: '/lora_new/api/folder_info',
     userMeta: '/lora_new/api/user_metadata',
     preview: '/lora_new/api/preview',
@@ -334,6 +335,8 @@
     addDict: '<svg class="lna-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"></path><path d="M12.5 7.5v6M9.5 10.5h6"></path></svg>',
     // 铅笔（人工修正译文）
     editZh: '<svg class="lna-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.6 3.4a2.1 2.1 0 0 1 3 3L7.6 18.4l-4 1 1-4z"></path></svg>',
+    // 列表（查看模型所有标签）
+    list: '<svg class="lna-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"></path><path d="M3.6 6h.01M3.6 12h.01M3.6 18h.01"></path></svg>',
   };
 
   // ---------- HTML 模板（用 class，不用 id） ----------
@@ -3341,6 +3344,506 @@
     dlg.querySelector('.dlg-close').focus();
   }
 
+  // ---------- 查看模型所有标签（嵌套弹窗，列表 + 分页） ----------
+  // 数据源：ss_tag_frequency 汇总后的完整标签（后端不截断，按出现次数降序）。
+  // 四栏：序号 / 标签键（单词）/ 标签值（数字）/ 译文（默认留空，后续再接翻译功能）。
+  function openAllTagsDialog(rel, mainBody) {
+    if (document.querySelector('.lna-alltags-mask')) return; // 已打开，忽略重复点击
+    const mask = document.createElement('div');
+    mask.className = 'lna-modal-mask lna-modal-mask--nested lna-alltags-mask';
+    const dlg = document.createElement('div');
+    dlg.className = 'lna-dialog lna-alltags-dlg';
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    dlg.setAttribute('aria-label', t('cf.allTagsLabel'));
+    dlg.innerHTML = `
+      <header>
+        <span class="dlg-title">${t('cf.allTagsLabel')}<span class="lna-cf-hint">${t('cf.allTagsHint')}</span></span>
+        <label class="lna-alltags-size-wrap">
+          <span class="lna-alltags-size-label">${t('cf.allTagsSize')}</span>
+          <select class="lna-alltags-size" aria-label="${esc(t('cf.allTagsSize'))}">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+            <option value="all">${t('cf.allTagsSizeAll')}</option>
+          </select>
+        </label>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
+      </header>
+      <div class="dlg-body">
+        <div class="dlg-loading" role="status" aria-live="polite">
+          <span class="lna-spinner" aria-hidden="true"></span>${t('cf.allTagsLoading')}</div>
+      </div>
+      <div class="dlg-footer">
+        <span class="lna-alltags-total" role="status" aria-live="polite"></span>
+        <button class="dlg-btn dlg-action lna-alltags-translate" type="button" title="${esc(t('cf.allTagsTranslate'))}"><span class="lna-spinner" aria-hidden="true" hidden></span><span class="lna-alltags-translate-label">${t('cf.allTagsTranslate')}</span></button>
+        <span class="lna-zh-time" role="status" aria-live="polite"></span>
+        <div class="lna-alltags-pager">
+          <button class="dlg-btn dlg-action lna-alltags-prev" type="button">${t('cf.allTagsPrev')}</button>
+          <span class="lna-alltags-page">
+            <span class="lna-alltags-page-pre"></span>
+            <input class="lna-alltags-page-input" type="number" min="1" step="1" inputmode="numeric" title="${esc(t('cf.allTagsJump'))}" aria-label="${esc(t('cf.allTagsJump'))}" disabled>
+            <span class="lna-alltags-page-post"></span>
+          </span>
+          <button class="dlg-btn dlg-action lna-alltags-next" type="button">${t('cf.allTagsNext')}</button>
+        </div>
+        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('settings.close')}</button>
+      </div>`;
+    mask.appendChild(dlg);
+    document.body.appendChild(mask);
+    lockScroll();
+
+    let closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      mask.remove();
+      unlockScroll();
+    }
+    dlg.querySelector('.dlg-close').addEventListener('click', close);
+    dlg.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
+    mask.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') trapFocus(e, dlg, close);
+    });
+
+    const body = dlg.querySelector('.dlg-body');
+    const totalEl = dlg.querySelector('.lna-alltags-total');
+    const pagePre = dlg.querySelector('.lna-alltags-page-pre');
+    const pagePost = dlg.querySelector('.lna-alltags-page-post');
+    const pageInput = dlg.querySelector('.lna-alltags-page-input');
+    const prevBtn = dlg.querySelector('.lna-alltags-prev');
+    const nextBtn = dlg.querySelector('.lna-alltags-next');
+    const sizeSelect = dlg.querySelector('.lna-alltags-size');
+    // 页码模板在 {cur} 处切开：数字框插在中间，「第/Page/ページ … 页」等前后缀由语言包决定，
+    // 这样各语言把页码放在哪一侧都正确，无需为「输入框」再新增一套键。
+    const PAGE_TPL = t('cf.allTagsPage').split('{cur}');
+
+    let tags = [];
+    let page = 0;
+    let pageSize = '50'; // 每页条数；'all' 表示全部显示在一页
+    const zhMap = {};    // tag -> 中文译文（【翻译标签】按钮写入，第四列展示）
+    let translating = false;
+
+    function pageRows() {
+      const n = pageSize === 'all' ? tags.length : Number(pageSize);
+      return n > 0 ? n : 1;
+    }
+    function pages() { return Math.max(1, Math.ceil(tags.length / pageRows())); }
+
+    function fillTpl(part, total) {
+      return String(part || '').replace('{total}', String(total)).trim();
+    }
+
+    function renderPage() {
+      const total = pages();
+      if (page > total - 1) page = total - 1;
+      const size = pageRows();
+      const start = page * size;
+      const rows = tags.slice(start, start + size).map(([tag, cnt], i) => {
+        const zh = zhMap[tag];
+        return `
+        <tr>
+          <td class="lna-alltags-index">${start + i + 1}</td>
+          <td class="lna-alltags-tag" data-tag="${esc(tag)}">${esc(tag)}</td>
+          <td class="lna-alltags-count">${esc(cnt)}</td>
+          <td class="lna-alltags-zh">${zh && zh !== tag ? esc(zh) : ''}</td>
+          <td class="lna-alltags-actions">
+            <button class="dlg-btn dlg-action lna-alltags-edit" type="button">${t('cf.allTagsEdit')}</button>
+            <button class="dlg-btn dlg-action lna-alltags-dict" type="button">${t('cf.allTagsDict')}</button>
+          </td>
+        </tr>`;
+      }).join('');
+      body.innerHTML = `
+        <div class="lna-alltags-wrap">
+          <table class="lna-alltags">
+            <thead><tr>
+              <th>${t('cf.allTagsColIndex')}</th>
+              <th>${t('cf.allTagsColTag')}</th>
+              <th>${t('cf.allTagsColCount')}</th>
+              <th>${t('cf.allTagsColZh')}</th>
+              <th>${t('cf.allTagsColActions')}</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+      totalEl.textContent = t('cf.allTagsTotal', { n: tags.length });
+      totalEl.classList.remove('is-err');
+      pagePre.textContent = fillTpl(PAGE_TPL[0], total);
+      pagePost.textContent = fillTpl(PAGE_TPL[1], total);
+      pageInput.value = String(page + 1);
+      pageInput.max = String(total);
+      pageInput.disabled = false;
+      prevBtn.disabled = page <= 0;
+      nextBtn.disabled = page >= total - 1;
+    }
+
+    function showEmpty(msg, isErr) {
+      body.innerHTML = `<div class="dlg-empty">${esc(msg)}</div>`;
+      totalEl.textContent = isErr ? msg : t('cf.allTagsTotal', { n: 0 });
+      totalEl.classList.toggle('is-err', !!isErr);
+      pagePre.textContent = '';
+      pagePost.textContent = '';
+      pageInput.value = '';
+      pageInput.disabled = true;
+      prevBtn.disabled = true;
+      nextBtn.disabled = true;
+    }
+
+    // 页码输入框：回车或失去焦点时跳页；越界（<1 或 >总页数）自动夹取到合法范围
+    function commitPage() {
+      if (pageInput.disabled) return;
+      const total = pages();
+      let n = parseInt(pageInput.value, 10);
+      if (!isFinite(n)) { pageInput.value = String(page + 1); return; } // 非数字 → 还原当前页
+      if (n < 1) n = 1;
+      if (n > total) n = total;
+      if (n - 1 !== page) { page = n - 1; renderPage(); }
+      else pageInput.value = String(page + 1); // 值被夹取过时归位
+    }
+    pageInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitPage(); }
+    });
+    pageInput.addEventListener('blur', commitPage);
+
+    // 切换每页条数：重置到第一页并重绘（无数据时仅改状态，不渲染空表）
+    sizeSelect.addEventListener('change', () => {
+      pageSize = sizeSelect.value;
+      page = 0;
+      if (tags.length) renderPage();
+    });
+
+    prevBtn.addEventListener('click', () => { if (page > 0) { page -= 1; renderPage(); } });
+    nextBtn.addEventListener('click', () => { if (page < pages() - 1) { page += 1; renderPage(); } });
+
+    // 【翻译标签】：只翻译「当前页」显示的标签，其余页不翻译。
+    // 沿用全局「翻译方案」（与卡片设置弹窗共用同一后端模式，本弹窗不再放方案控件）。
+    // 分批：每次请求最多 50 个标签（如某页 200 个 → 4 批），结果累积到 zhMap 后回填第四列。
+    const TAGS_PER_BATCH = 50;
+    const tsBtn = dlg.querySelector('.lna-alltags-translate');
+    const tsSpinner = tsBtn.querySelector('.lna-spinner');
+    const tsLabel = tsBtn.querySelector('.lna-alltags-translate-label');
+    const tsTime = dlg.querySelector('.lna-zh-time');
+
+    // 就地回填第四列（不整表重绘，避免滚动位置被弹回顶部）
+    function applyZhToRows() {
+      body.querySelectorAll('tbody tr').forEach((tr) => {
+        const tagTd = tr.querySelector('.lna-alltags-tag');
+        const zhTd = tr.querySelector('.lna-alltags-zh');
+        if (!tagTd || !zhTd) return;
+        const zh = zhMap[tagTd.dataset.tag];
+        zhTd.textContent = zh && zh !== tagTd.dataset.tag ? zh : '';
+      });
+    }
+
+    // 单批请求：撞上其它标签页正在翻译时，等全局空闲后重试一次；失败返回 null
+    async function postTranslateBatch(batch) {
+      const opts = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tags: batch, rel: rel || '', force: false }),
+      };
+      let r = await fetch(API.translate, opts);
+      let res = await r.json();
+      if (res && res.busy) {
+        if (!(await zhWaitIdle(body, 180000))) return null;
+        r = await fetch(API.translate, opts);
+        res = await r.json();
+      }
+      if (!r.ok || !res || !res.ok) return null;
+      return res;
+    }
+
+    tsBtn.addEventListener('click', async () => {
+      if (translating) return; // 本弹窗已在翻译
+      if (!tags.length) { flashToast(t('cf.allTagsEmpty'), true); return; }
+      // 只取当前页可见的标签
+      const size = pageRows();
+      const pageTags = tags.slice(page * size, page * size + size).map((x) => x[0]);
+      if (!pageTags.length) { flashToast(t('cf.allTagsEmpty'), true); return; }
+      if (await zhStatusBusy()) { flashToast(t('toast.translating'), true); return; } // 其它标签页在跑
+      translating = true;
+      tsBtn.classList.add('busy');
+      tsSpinner.hidden = false;
+      tsLabel.textContent = t('cf.translating');
+      tsTime.textContent = '';
+      tsTime.classList.remove('is-err');
+      setDlgBusy(body, true); // 翻译在途：禁止关闭/翻页等操作
+      const t0 = performance.now();
+      let ok = true;
+      try {
+        if (!(await zhWaitIdle(body, 180000))) {
+          ok = false; // 关闭弹窗或等待超时
+        } else {
+          for (let i = 0; i < pageTags.length; i += TAGS_PER_BATCH) {
+            if (!document.contains(dlg)) { ok = false; break; }
+            const batch = pageTags.slice(i, i + TAGS_PER_BATCH);
+            const res = await postTranslateBatch(batch);
+            if (!res) { ok = false; break; }
+            Object.assign(zhMap, res.translations || {});
+            applyZhToRows();
+          }
+        }
+      } catch (e) {
+        ok = false;
+      }
+      translating = false;
+      if (!document.contains(dlg)) return; // 弹窗已被关闭
+      tsBtn.classList.remove('busy');
+      tsSpinner.hidden = true;
+      tsLabel.textContent = t('cf.allTagsTranslate');
+      setDlgBusy(body, false);
+      refreshLlmState(); // 翻译可能触发模型加载，立即刷新顶栏状态按钮
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      tsTime.textContent = ok ? t('cf.lastTook', { secs }) : t('cf.translateFailed');
+      tsTime.classList.toggle('is-err', !ok);
+      if (!ok) flashToast(t('cf.translateFailed'), true);
+    });
+
+    // 操作列：行会随翻页重绘，用 body 级委托最稳。
+    // 【修改译文】/【加入词典】都针对该行单个单词，各自弹出小窗。
+    body.addEventListener('click', (e) => {
+      const editBtn = e.target.closest('.lna-alltags-edit');
+      const dictBtn = e.target.closest('.lna-alltags-dict');
+      if (!editBtn && !dictBtn) return;
+      if (translating) { flashToast(t('toast.translating'), true); return; } // 翻译在途禁止并发操作
+      const tr = e.target.closest('tr');
+      const tagTd = tr && tr.querySelector('.lna-alltags-tag');
+      const tag = tagTd ? tagTd.dataset.tag : '';
+      if (!tag) return;
+      if (editBtn) openAllTagsEditDialog(tag, rel, zhMap, mainBody, applyZhToRows);
+      else openAllTagsDictDialog(tag, zhMap);
+    });
+
+    (async () => {
+      try {
+        const r = await fetch(`${API.modelTags}?rel=${encodeURIComponent(rel)}`);
+        const res = await r.json();
+        if (closed || !document.contains(dlg)) return;
+        if (!res || !res.ok) {
+          showEmpty((res && res.error) || t('cf.allTagsLoadFailed'), true);
+          return;
+        }
+        tags = Array.isArray(res.tags) ? res.tags : [];
+        // 回显已持久化的译文（刷新后仍显示），与「翻译标签」写回同一份数据
+        const tr = res.tag_translations || {};
+        Object.keys(tr).forEach((k) => {
+          if (tr[k] && tr[k] !== k) zhMap[k] = tr[k];
+        });
+        if (!tags.length) { showEmpty(t('cf.allTagsEmpty'), false); return; }
+        renderPage();
+      } catch (e) {
+        if (closed || !document.contains(dlg)) return;
+        showEmpty(t('cf.allTagsLoadFailed'), true);
+      }
+    })();
+
+    dlg.querySelector('.dlg-close').focus();
+  }
+
+  // ---------- 查看所有标签：单标签【修改译文】弹窗 ----------
+  // 只针对一个固定单词，无选择步骤；保存后写入该模型 JSON（持久化）+ 全局译文缓存。
+  function openAllTagsEditDialog(tag, rel, zhMap, mainBody, onSaved) {
+    if (document.querySelector('.lna-alltags-edit-mask')) return; // 已打开，忽略重复点击
+    const curZh = zhMap[tag] && zhMap[tag] !== tag ? zhMap[tag] : '';
+    const mask = document.createElement('div');
+    mask.className = 'lna-modal-mask lna-modal-mask--nested lna-alltags-edit-mask';
+    const dlg = document.createElement('div');
+    dlg.className = 'lna-dialog lna-repick-dlg';
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    dlg.setAttribute('aria-label', t('cf.editZhLabel'));
+    dlg.innerHTML = `
+      <header>
+        <span class="dlg-title">${t('cf.editZhLabel')}<span class="lna-cf-hint">${t('tag.manualHint')}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
+      </header>
+      <div class="dlg-body">
+        <div class="lna-dict-result" role="status" aria-live="polite">
+          ${dictRowTagZh(tag, curZh)}
+          <div class="lna-dict-line">
+            <span class="lna-dict-k">${t('tag.fixZh')}</span>
+            <input class="lna-mt-input" type="text" placeholder="${esc(t('tag.fixZhPlaceholder'))}" aria-label="${esc(t('tag.fixZh'))}" value="${esc(curZh)}">
+            <button class="dlg-btn lna-save-blue lna-dict-save" type="button">${t('tag.modifyZh')}</button>
+          </div>
+        </div>
+      </div>
+      <div class="dlg-footer">
+        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('settings.close')}</button>
+      </div>`;
+    mask.appendChild(dlg);
+    document.body.appendChild(mask);
+    lockScroll();
+
+    let closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      mask.remove();
+      unlockScroll();
+    }
+    dlg.querySelector('.dlg-close').addEventListener('click', close);
+    dlg.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
+    mask.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') trapFocus(e, dlg, close);
+    });
+
+    const input = dlg.querySelector('.lna-mt-input');
+    const saveBtn = dlg.querySelector('.lna-dict-save');
+    saveBtn.addEventListener('click', async () => {
+      if (saveBtn.classList.contains('busy')) return;
+      const val = input.value.trim();
+      if (!val) { flashToast(t('tag.needZh'), true); input.focus(); return; }
+      saveBtn.classList.add('busy');
+      saveBtn.textContent = t('tag.saving');
+      try {
+        const r = await fetch(API.tagTranslation, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rel: rel || '', tag, value: val }),
+        });
+        const res = await r.json();
+        if (!document.contains(dlg)) return;
+        if (res && res.ok) {
+          zhMap[tag] = val;
+          // 卡片设置弹窗里的同一标签同步刷新（若该标签在其 24 个之内）
+          if (mainBody && document.contains(mainBody)) applyTagTranslations(mainBody, { [tag]: val }, true);
+          flashToast(t('tag.fixedZhToast', { tag }));
+          if (onSaved) onSaved();
+          close();
+        } else {
+          flashToast(t('tag.writeFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
+          saveBtn.classList.remove('busy');
+          saveBtn.textContent = t('tag.modifyZh');
+        }
+      } catch (e) {
+        flashToast(t('tag.writeFailedReq'), true);
+        saveBtn.classList.remove('busy');
+        saveBtn.textContent = t('tag.modifyZh');
+      }
+    });
+    input.focus();
+  }
+
+  // ---------- 查看所有标签：单标签【加入词典】弹窗 ----------
+  // 针对一个固定单词：查询词典（已收录→替换 / 未收录→添加），写入内容取该标签当前译文。
+  function openAllTagsDictDialog(tag, zhMap) {
+    if (document.querySelector('.lna-alltags-dict-mask')) return; // 已打开，忽略重复点击
+    const zhText = zhMap[tag] && zhMap[tag] !== tag ? zhMap[tag] : '';
+    const mask = document.createElement('div');
+    mask.className = 'lna-modal-mask lna-modal-mask--nested lna-alltags-dict-mask';
+    const dlg = document.createElement('div');
+    dlg.className = 'lna-dialog lna-repick-dlg';
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    dlg.setAttribute('aria-label', t('cf.dictLabel'));
+    // 查询中 / 结果两态共用同一骨架，切换时高度不变
+    function skeleton(matchHtml, btnLabel, canWrite) {
+      return `${dictRowTagZh(tag, zhText)}
+        <div class="lna-dict-line">
+          <div class="lna-dict-row"><span class="lna-dict-k">${t('tag.dictMatch')}</span><span class="lna-dict-v">${matchHtml}</span></div>
+          <button class="dlg-btn primary lna-dict-save" type="button"${canWrite ? '' : ' aria-disabled="true"'}>${btnLabel}</button>
+        </div>`;
+    }
+    dlg.innerHTML = `
+      <header>
+        <span class="dlg-title">${t('cf.dictLabel')}<span class="lna-cf-hint">${t('tag.dictHint')}</span></span>
+        <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
+      </header>
+      <div class="dlg-body">
+        <div class="lna-dict-result" role="status" aria-live="polite">
+          ${skeleton(`<em class="lna-dict-none">${t('tag.queryingDict')}</em>`, t('tag.addToDict'), false)}
+        </div>
+      </div>
+      <div class="dlg-footer">
+        <button class="dlg-btn dlg-cancel" data-act="cancel" type="button">${t('settings.close')}</button>
+      </div>`;
+    mask.appendChild(dlg);
+    document.body.appendChild(mask);
+    lockScroll();
+
+    let closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      mask.remove();
+      unlockScroll();
+    }
+    dlg.querySelector('.dlg-close').addEventListener('click', close);
+    dlg.querySelector('[data-act="cancel"]').addEventListener('click', close);
+    mask.__lnaClose = close; // 供文档级 Esc 关闭逻辑取用
+    mask.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') trapFocus(e, dlg, close);
+    });
+
+    const resultBox = dlg.querySelector('.lna-dict-result');
+
+    // found → 【替换词典译文】；未收录 → 【添加到词典】；无译文 → 置灰不可写
+    function renderResult(lookup) {
+      if (!lookup || !lookup.ok) {
+        resultBox.innerHTML = skeleton(
+          `<span class="lna-dict-tip is-err">${t('tag.dictQueryFailed', { msg: (lookup && lookup.error) || t('tag.apiUnavailable') })}</span>`,
+          t('tag.addToDict'), false);
+        return;
+      }
+      const dictVal = lookup.dict_value || '';
+      const canWrite = !!zhText;
+      const btnLabel = lookup.found ? t('tag.replaceDict') : t('tag.addToDict');
+      const same = !!zhText && normZh(zhText) === normZh(dictVal);
+      const matchHtml = !lookup.found
+        ? `<b class="lna-dict-miss">${t('tag.notInDict')}</b>`
+        : `<span class="${same ? 'lna-dict-hit' : 'lna-dict-diff'}">${t('tag.inDictValue', { v: esc(dictVal) })}</span>`;
+      resultBox.innerHTML = skeleton(matchHtml, btnLabel, canWrite);
+      const saveBtn = resultBox.querySelector('.lna-dict-save');
+      if (!saveBtn) return;
+      saveBtn.addEventListener('click', async () => {
+        if (saveBtn.classList.contains('busy')) return;
+        if (!canWrite) { flashToast(t('tag.noZhToWrite'), true); return; }
+        saveBtn.classList.add('busy');
+        const oldText = saveBtn.textContent;
+        saveBtn.textContent = t('tag.writing');
+        try {
+          const r = await fetch(API.dictUpsert, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag, value: zhText }),
+          });
+          const res = await r.json();
+          if (!document.contains(dlg)) return;
+          if (res && res.ok) {
+            flashToast(lookup.found ? t('tag.replacedDictToast', { tag }) : t('tag.addedDictToast', { tag }));
+            renderResult({ ok: true, key: res.key, found: true, dict_value: res.value });
+          } else {
+            flashToast(t('tag.writeFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
+            saveBtn.classList.remove('busy');
+            saveBtn.textContent = oldText;
+          }
+        } catch (e) {
+          flashToast(t('tag.writeFailedReq'), true);
+          saveBtn.classList.remove('busy');
+          saveBtn.textContent = oldText;
+        }
+      });
+    }
+
+    (async () => {
+      try {
+        const r = await fetch(`${API.dictLookup}?tag=${encodeURIComponent(tag)}`);
+        const lookup = await r.json();
+        if (closed || !document.contains(dlg)) return;
+        renderResult(lookup);
+      } catch (e) {
+        if (closed || !document.contains(dlg)) return;
+        renderResult(null);
+      }
+    })();
+
+    dlg.querySelector('.dlg-close').focus();
+  }
+
   // 参考内置实现：按标签词频随机抽词组成提示词
   function randomPromptFromTags(tags) {
     if (!tags || !tags.length) return '';
@@ -3439,6 +3942,7 @@
       <div class="lna-cf-field">
         <div class="lna-cf-tags-head">
           <span class="lna-cf-label lna-cf-tags-title">${t('cf.tagsTitle')}<span class="lna-cf-hint">${t('cf.tagsHint')}</span></span>
+          ${hasTags ? `<button class="dlg-btn dlg-action lna-cf-tags-all" type="button" title="${esc(t('cf.allTagsHint'))}">${ICON.list}${t('cf.allTagsLabel')}</button>` : ''}
         </div>
         <div class="lna-cf-tags${state.showTagZh ? ' show-zh' : ''}">${tagsHtml(info.tags)}</div>
         ${hasTags ? `
@@ -3708,6 +4212,12 @@
         if (body.__lnaZhPromise) { flashToast(t('toast.translating'), true); return; }
         openManualTranslateDialog(body, info, l.rel);
       });
+    }
+
+    // 查看模型所有标签：打开嵌套弹窗，分页展示 ss_tag_frequency 完整标签
+    const viewAllTagsBtn = body.querySelector('.lna-cf-tags-all');
+    if (viewAllTagsBtn) {
+      viewAllTagsBtn.addEventListener('click', () => openAllTagsDialog(l.rel, body));
     }
 
     // 权重滑块 ↔ 数字框
@@ -4179,8 +4689,8 @@
   }
 
   function closeModal(el) {
-    // 主弹窗关闭时连带关闭嵌套小弹窗（重翻/词典/数据对比/数据统一化），避免残留蒙版
-    document.querySelectorAll('.lna-repick-mask, .lna-dict-mask, .lna-cmp-mask, .lna-unify-mask').forEach((m) => {
+    // 主弹窗关闭时连带关闭嵌套小弹窗（重翻/词典/人工修正/数据对比/数据统一化/查看所有标签），避免残留蒙版
+    document.querySelectorAll('.lna-repick-mask, .lna-dict-mask, .lna-cmp-mask, .lna-unify-mask, .lna-alltags-mask, .lna-alltags-edit-mask, .lna-alltags-dict-mask').forEach((m) => {
       m.remove();
       unlockScroll();
     });

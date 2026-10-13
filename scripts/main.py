@@ -512,6 +512,27 @@ def _short_hash(path: Path, rel: str, meta: dict) -> str:
     return str(h)[:10]
 
 
+def _read_safetensors_meta(path: Path, safe: str) -> dict:
+    """读取 safetensors 内部元数据（带 mtime 缓存）；非 safetensors 或读取失败返回空 dict。
+
+    封面字段过大，不适合在 UI 中以文本展示，统一剔除。
+    """
+    meta: dict = {}
+    if path.suffix.lower() == ".safetensors":
+        try:
+            # 延迟导入，避免扩展加载时引入 sd_models 的重依赖
+            from modules import cache, sd_models
+
+            meta = cache.cached_data_for_file(
+                "safetensors-metadata", "lora_new/" + safe, str(path),
+                lambda: sd_models.read_metadata_from_safetensors(str(path)),
+            ) or {}
+        except Exception:
+            meta = {}
+    meta.pop("ssmd_cover_images", None)
+    return meta
+
+
 def card_info(rel: str) -> dict:
     """卡片设置弹窗所需的全部数据：文件信息、元数据表、训练标签、用户元数据。"""
     safe = _safe_rel(rel)
@@ -525,18 +546,7 @@ def card_info(rel: str) -> dict:
     except Exception:
         return {"ok": False, "error": _t("err.readFileInfo")}
 
-    meta: dict = {}
-    if path.suffix.lower() == ".safetensors":
-        try:
-            from modules import cache, sd_models
-
-            meta = cache.cached_data_for_file(
-                "safetensors-metadata", "lora_new/" + safe, str(path),
-                lambda: sd_models.read_metadata_from_safetensors(str(path)),
-            ) or {}
-        except Exception:
-            meta = {}
-    meta.pop("ssmd_cover_images", None)
+    meta = _read_safetensors_meta(path, safe)
 
     table: list[dict] = [
         {"key": "filename", "label": _t("info.filename"), "value": safe},
@@ -619,6 +629,24 @@ def card_info(rel: str) -> dict:
         "user": user,
         "tag_translations": zh_map,   # 已持久化的中文对照，前端据此显示/占位
     }
+
+
+def model_tags(rel: str) -> dict:
+    """「查看模型所有标签」弹窗数据：ss_tag_frequency 汇总后的完整标签（不截断，按次数降序）。
+
+    同时返回该模型已持久化的中文对照，供弹窗重新打开时回显（否则刷新后译文会“消失”）。
+    """
+    safe = _safe_rel(rel)
+    if not safe:
+        return {"ok": False, "error": _t("err.invalidPath")}
+    path = LORA_DIR / safe
+    if not path.is_file() or path.suffix.lower() not in LORA_EXTS:
+        return {"ok": False, "error": _t("err.fileNotFound")}
+    meta = _read_safetensors_meta(path, safe)
+    user = _get_card_data(safe)
+    zh_map = user.get("translations")
+    zh_map = zh_map.get("zh", {}) if isinstance(zh_map, dict) else {}
+    return {"ok": True, "rel": safe, "tags": build_tags(meta), "tag_translations": zh_map}
 
 
 def folder_info(rel: str) -> dict:
@@ -2512,6 +2540,10 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     @app.get("/lora_new/api/card_info")
     def api_card_info(rel: str = ""):
         return card_info(rel)
+
+    @app.get("/lora_new/api/model_tags")
+    def api_model_tags(rel: str = ""):
+        return model_tags(rel)
 
     @app.get("/lora_new/api/folder_info")
     def api_folder_info(rel: str = ""):

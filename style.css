@@ -1103,7 +1103,8 @@ body.dark .lna-dialog .lna-size-input { border-color: #374151; background: #1f29
 .lna-dialog .lna-llm-select,
 .lna-dialog .lna-llm-file,
 .lna-dialog .lna-prompt-select,
-.lna-dialog .lna-lang-select {
+.lna-dialog .lna-lang-select,
+.lna-dialog .lna-alltags-size {
   box-sizing: border-box;
   height: 28px;
   max-width: 320px;
@@ -1118,7 +1119,8 @@ body.dark .lna-dialog .lna-size-input { border-color: #374151; background: #1f29
 body.dark .lna-dialog .lna-llm-select,
 body.dark .lna-dialog .lna-llm-file,
 body.dark .lna-dialog .lna-prompt-select,
-body.dark .lna-dialog .lna-lang-select { border-color: #374151; background: #1f2937; color: #f3f4f6; }
+body.dark .lna-dialog .lna-lang-select,
+body.dark .lna-dialog .lna-alltags-size { border-color: #374151; background: #1f2937; color: #f3f4f6; }
 .lna-dialog .lna-prompt-select:focus,
 .lna-dialog .lna-lang-select:focus {
   outline: none;
@@ -1709,6 +1711,9 @@ body.dark .lna-dialog .lna-cf-preview-hint { color: #9ca3af; }
   font-size: 16px;
   margin-bottom: 0;
 }
+/* 标题占满剩余宽度，把右侧的「查看模型所有标签」按钮推到最右 */
+.lna-dialog .lna-cf-tags-head .lna-cf-tags-title { flex: 1 1 auto; }
+.lna-dialog .lna-cf-tags-head .dlg-btn { height: 30px; padding: 0 14px; }
 /* 翻译功能按钮行：位于标签区下方 */
 .lna-dialog .lna-cf-tags-actions {
   display: flex;
@@ -1721,7 +1726,8 @@ body.dark .lna-dialog .lna-cf-preview-hint { color: #9ca3af; }
 /* 翻译方案控件与同行按钮/胶囊等高，保持垂直居中对齐 */
 .lna-dialog .lna-cf-tags-actions .lna-mode-btn { height: 32px; }
 /* 翻译功能按钮内嵌的 SVG 图标：扁平单色，仅取形状，颜色沿用插件主题（currentColor） */
-.lna-dialog .lna-cf-tags-actions .dlg-btn .lna-ico {
+.lna-dialog .lna-cf-tags-actions .dlg-btn .lna-ico,
+.lna-dialog .lna-cf-tags-head .dlg-btn .lna-ico {
   width: 16px;
   height: 16px;
   display: inline-block;
@@ -1779,8 +1785,10 @@ body.dark .lna-dialog .lna-zh-key.active { background: #ea580c; color: #fff; }
    禁用态不再半透明，保持醒目 */
 .lna-dialog .dlg-btn.lna-cf-zh-all.busy,
 .lna-dialog .dlg-btn.lna-cf-zh-missing.busy,
+.lna-dialog .dlg-btn.lna-alltags-translate.busy,
 body.dark .lna-dialog .dlg-btn.lna-cf-zh-all.busy,
-body.dark .lna-dialog .dlg-btn.lna-cf-zh-missing.busy {
+body.dark .lna-dialog .dlg-btn.lna-cf-zh-missing.busy,
+body.dark .lna-dialog .dlg-btn.lna-alltags-translate.busy {
   background: #c2410c;
   border-color: #c2410c;
   color: #fff;
@@ -1789,10 +1797,12 @@ body.dark .lna-dialog .dlg-btn.lna-cf-zh-missing.busy {
 }
 .lna-dialog .dlg-btn.lna-cf-zh-all .lna-spinner,
 .lna-dialog .dlg-btn.lna-cf-zh-missing .lna-spinner,
+.lna-dialog .dlg-btn.lna-alltags-translate .lna-spinner,
 .lna-dialog .dlg-btn.lna-zh-repick .lna-spinner { width: 14px; height: 14px; margin-right: 6px; vertical-align: -2px; }
 /* 覆盖 inline-block，hidden 才生效 */
 .lna-dialog .dlg-btn.lna-cf-zh-all .lna-spinner[hidden],
 .lna-dialog .dlg-btn.lna-cf-zh-missing .lna-spinner[hidden],
+.lna-dialog .dlg-btn.lna-alltags-translate .lna-spinner[hidden],
 .lna-dialog .dlg-btn.lna-zh-repick .lna-spinner[hidden] { display: none; }
 /* 「确认重新翻译」忙碌态：与批量翻译按钮同款橙底白字 */
 .lna-dialog .dlg-btn.lna-zh-repick.busy,
@@ -1816,6 +1826,137 @@ body.dark .lna-dialog .dlg-btn.lna-zh-repick.busy {
 .lna-dialog.lna-repick-dlg .lna-cf-tags.show-zh { max-height: none; overflow-y: visible; }
 .lna-dialog.lna-repick-dlg .dlg-footer { position: relative; }
 .lna-dialog.lna-repick-dlg .lna-zh-time { flex: 1 1 auto; }
+
+/* ---------- 查看模型所有标签（嵌套弹窗，列表 + 分页） ---------- */
+.lna-dialog.lna-alltags-dlg {
+  width: min(820px, 92vw);
+  max-height: 80vh;
+}
+/* 总数文本占满剩余宽度，把分页控件与关闭按钮推到右侧 */
+.lna-dialog.lna-alltags-dlg .lna-alltags-total { flex: 1 1 auto; font-size: 13px; }
+/* header 内的「每页条数」下拉：margin-left:auto 让标签与关闭按钮靠右排列 */
+.lna-dialog .lna-alltags-size-wrap {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.lna-dialog .lna-alltags-size-label {
+  font-size: 12px;
+  color: #4b5563;
+  white-space: nowrap;
+}
+body.dark .lna-dialog .lna-alltags-size-label { color: #9ca3af; }
+.lna-dialog .lna-alltags-size { height: 28px; min-width: 84px; }
+.lna-dialog .lna-alltags-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* 首页/末页时禁用对应翻页按钮 */
+.lna-dialog .lna-alltags-pager .dlg-btn:disabled { opacity: .5; cursor: not-allowed; }
+.lna-dialog .lna-alltags-page {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: #4b5563;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+body.dark .lna-dialog .lna-alltags-page { color: #9ca3af; }
+/* 页码输入框：回车/失焦跳页；隐藏数字微调箭头以适配窄宽度 */
+.lna-dialog .lna-alltags-page-input {
+  width: 52px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid #d5d8de;
+  border-radius: 6px;
+  background: #fff;
+  color: #1f2937;
+  font-size: 13px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.lna-dialog .lna-alltags-page-input:disabled { background: #f3f4f6; color: #9ca3af; cursor: not-allowed; }
+.lna-dialog .lna-alltags-page-input:focus { border-color: #c2410c; outline: none; }
+.lna-dialog .lna-alltags-page-input::-webkit-outer-spin-button,
+.lna-dialog .lna-alltags-page-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+body.dark .lna-dialog .lna-alltags-page-input {
+  background: #1f2937;
+  color: #f3f4f6;
+  border-color: #374151;
+}
+body.dark .lna-dialog .lna-alltags-page-input:disabled { background: #111827; color: #6b7280; }
+body.dark .lna-dialog .lna-alltags-page-input:focus { border-color: #fb923c; }
+/* 表格容器：圆角描边，超出时由外层 .dlg-body 统一滚动 */
+.lna-dialog .lna-alltags-wrap {
+  border: 1px solid #d5d8de;
+  border-radius: 8px;
+  overflow: hidden;
+}
+body.dark .lna-dialog .lna-alltags-wrap { border-color: #374151; }
+.lna-dialog table.lna-alltags {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.lna-dialog table.lna-alltags th,
+.lna-dialog table.lna-alltags td {
+  padding: 6px 10px;
+  text-align: center;
+  border-right: 1px solid #e5e7eb;
+  border-bottom: 1px solid #e5e7eb;
+}
+body.dark .lna-dialog table.lna-alltags th,
+body.dark .lna-dialog table.lna-alltags td { border-right-color: #374151; border-bottom-color: #374151; }
+/* 末列的竖线与末行的横线由外层圆角描边收口，不再重复画线 */
+.lna-dialog table.lna-alltags th:last-child,
+.lna-dialog table.lna-alltags td:last-child { border-right: none; }
+.lna-dialog table.lna-alltags thead th {
+  background: #f3f4f6;
+  font-weight: 600;
+  color: #374151;
+}
+body.dark .lna-dialog table.lna-alltags thead th { background: #374151; color: #e5e7eb; }
+.lna-dialog table.lna-alltags tbody tr:last-child td { border-bottom: none; }
+.lna-dialog table.lna-alltags .lna-alltags-tag { word-break: break-word; }
+.lna-dialog table.lna-alltags .lna-alltags-index {
+  width: 72px;
+  font-variant-numeric: tabular-nums;
+  color: #6b7280;
+}
+body.dark .lna-dialog table.lna-alltags .lna-alltags-index { color: #9ca3af; }
+.lna-dialog table.lna-alltags .lna-alltags-count {
+  width: 96px;
+  font-variant-numeric: tabular-nums;
+  color: #4b5563;
+}
+body.dark .lna-dialog table.lna-alltags .lna-alltags-count { color: #9ca3af; }
+.lna-dialog table.lna-alltags .lna-alltags-zh { width: 30%; }
+/* 操作列：每行两个小按钮（修改译文 / 加入词典） */
+.lna-dialog table.lna-alltags .lna-alltags-actions { width: 22%; white-space: nowrap; }
+.lna-dialog table.lna-alltags .lna-alltags-actions .dlg-btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+.lna-dialog table.lna-alltags .lna-alltags-actions .dlg-btn + .dlg-btn { margin-left: 6px; }
+/* 悬停配色：【修改译文】蓝底，【加入词典】绿底（均白字，满足对比度） */
+.lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-edit:hover,
+body.dark .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-edit:hover {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #fff;
+}
+.lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict:hover,
+body.dark .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict:hover {
+  background: #15803d;
+  border-color: #15803d;
+  color: #fff;
+}
 
 /* ---------- 词典对照结果区（将翻译对照添加到词典） ---------- */
 .lna-dialog .lna-dict-result {
