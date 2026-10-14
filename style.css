@@ -705,6 +705,41 @@ body.dark .lna-dialog .lna-idle-unit { color: #9ca3af; }
   outline-offset: -4px;
 }
 
+/* 删除 Lora 提示词按钮：位于「使用 Lora 提示词」按钮正上方，悬停/聚焦出现，红色调 */
+.lna-card .lna-del-btn {
+  position: absolute;
+  top: 50%; left: 50%;
+  /* 使用按钮高约 37px、间距约 10px，故中心上移 43px */
+  transform: translate(-50%, calc(-50% - 43px)) scale(.92);
+  z-index: 4;
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity .15s, transform .15s, background .12s;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+}
+.lna-card.lora:hover .lna-del-btn,
+.lna-card.lora:focus-visible .lna-del-btn,
+.lna-card.lora:has(:focus-visible) .lna-del-btn {
+  opacity: 1;
+  transform: translate(-50%, calc(-50% - 43px)) scale(1);
+}
+.lna-card .lna-del-btn:hover { background: #b91c1c; }
+.lna-card .lna-del-btn:focus-visible {
+  opacity: 1;
+  transform: translate(-50%, calc(-50% - 43px)) scale(1);
+  outline: 2px solid #fff;
+  outline-offset: -4px;
+}
+
 .lna-empty {
   padding: 40px;
   text-align: center;
@@ -1934,7 +1969,7 @@ body.dark .lna-dialog table.lna-alltags .lna-alltags-index { color: #9ca3af; }
   color: #4b5563;
 }
 body.dark .lna-dialog table.lna-alltags .lna-alltags-count { color: #9ca3af; }
-.lna-dialog table.lna-alltags .lna-alltags-zh { width: 30%; }
+.lna-dialog table.lna-alltags .lna-alltags-zh { width: 24%; }
 /* 操作列：每行两个小按钮（修改译文 / 加入词典） */
 .lna-dialog table.lna-alltags .lna-alltags-actions { width: 22%; white-space: nowrap; }
 .lna-dialog table.lna-alltags .lna-alltags-actions .dlg-btn {
@@ -1944,6 +1979,12 @@ body.dark .lna-dialog table.lna-alltags .lna-alltags-count { color: #9ca3af; }
   border-radius: 6px;
 }
 .lna-dialog table.lna-alltags .lna-alltags-actions .dlg-btn + .dlg-btn { margin-left: 6px; }
+/* 【加入词典】按钮配色：词典已收录且有值 → 与当前译文一致(绿) / 有差异(黄)；未收录 → 默认灰白边框。
+   放在下方悬停规则之前：悬停样式优先级与之一致且声明在后，故悬停仍按各自配色覆盖 */
+.lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict.is-matched { border-color: #15803d; color: #15803d; }
+body.dark .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict.is-matched { border-color: #4ade80; color: #4ade80; }
+.lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict.is-diff { border-color: #b45309; color: #b45309; }
+body.dark .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict.is-diff { border-color: #fbbf24; color: #fbbf24; }
 /* 悬停配色：【修改译文】蓝底，【加入词典】绿底（均白字，满足对比度） */
 .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-edit:hover,
 body.dark .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-edit:hover {
@@ -1956,6 +1997,16 @@ body.dark .lna-dialog table.lna-alltags .lna-alltags-actions .lna-alltags-dict:h
   background: #15803d;
   border-color: #15803d;
   color: #fff;
+}
+/* 「标签词显示」列（位于【操作】左侧）：两段连体胶囊（隐藏/显示），尺寸收窄以贴合行内小按钮。
+   列宽取 1% + nowrap：由内容决定宽度，剩余空间留给标签列，避免各语言文案长短导致换行 */
+.lna-dialog table.lna-alltags .lna-alltags-show { width: 1%; white-space: nowrap; }
+.lna-dialog table.lna-alltags .lna-alltags-show .lna-zh-switch { height: 26px; }
+.lna-dialog table.lna-alltags .lna-alltags-show .lna-zh-key {
+  height: 20px;
+  min-width: 44px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 /* ---------- 词典对照结果区（将翻译对照添加到词典） ---------- */
@@ -2268,6 +2319,7 @@ body.dark .lna-dialog .lna-cf-weight-num { border-color: #374151; background: #1
     animation: none !important;
   }
   .lna-card .lna-use-btn { transform: translate(-50%, -50%) !important; }
+  .lna-card .lna-del-btn { transform: translate(-50%, calc(-50% - 43px)) !important; }
 }
 
 /* ---------- 高对比模式兜底 ---------- */
@@ -2303,6 +2355,9 @@ body.dark .lna-dialog .lna-cf-weight-num { border-color: #374151; background: #1
 .lna-root .lna-card .lna-use-btn * { color: var(--lna-brand-contrast-text) !important; }
 .lna-root .lna-card .lna-use-btn:hover,
 .lna-root .lna-card .lna-use-btn:hover * { color: #fff !important; }
+/* 「删除 Lora 提示词」：红底上的白色文字（悬停底色变深，文字保持白色） */
+.lna-root .lna-card .lna-del-btn,
+.lna-root .lna-card .lna-del-btn * { color: #fff !important; }
 
 /* ---------- 大图预览（点击卡片设置弹窗右侧预览图打开）---------- */
 /* 有预览图时鼠标提示可点开大图（无图时 .is-empty，点击不生效） */

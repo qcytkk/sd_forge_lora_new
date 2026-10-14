@@ -479,6 +479,31 @@ def build_tags(metadata: dict) -> list[list]:
     return [[t, tags[t]] for t in sorted(tags, key=tags.get, reverse=True)]
 
 
+TAG_SHOW_LIMIT = 24  # 卡片设置「数据集的训练标签」默认显示上限（用户未手动设置时）
+
+
+def _tag_show_overrides(data: dict) -> dict:
+    """读取模型 JSON 的「标签词显示」覆盖表：tag → 'show' / 'hide'。
+
+    只保留显式覆盖；不在表中即走默认规则（出现次数前 TAG_SHOW_LIMIT 个显示）。
+    """
+    raw = data.get("tag_show")
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if str(v) in ("show", "hide"):
+                out[str(k)] = str(v)
+    return out
+
+
+def visible_tags(tags: list[list], overrides: dict) -> list[list]:
+    """卡片设置标签池实际展示的标签：默认前 TAG_SHOW_LIMIT 个，显式 'show' 的一律显示（可突破上限），
+    显式 'hide' 的一律不显示。"""
+    base = [row for row in tags[:TAG_SHOW_LIMIT] if overrides.get(row[0]) != "hide"]
+    extra = [row for row in tags[TAG_SHOW_LIMIT:] if overrides.get(row[0]) == "show"]
+    return base + extra
+
+
 def _detect_sd_version(meta: dict) -> str:
     if str(meta.get("modelspec.implementation", "")) == "https://github.com/black-forest-labs/flux":
         return "Flux"
@@ -603,7 +628,7 @@ def card_info(rel: str) -> dict:
     if img_count:
         table.append({"label": _t("info.datasetSize"), "value": str(img_count)})
 
-    tags = build_tags(meta)[:24]
+    all_tags = build_tags(meta)
     # 卡片资料改从 models_json_data 的镜像 JSON 读取；首次访问时补齐重定向锚点
     user = _get_card_data(safe)
     if not user.get("hash") or not user.get("size"):
@@ -611,8 +636,10 @@ def card_info(rel: str) -> dict:
             hash_row = next((r for r in table if r.get("key") == "hash"), None)
             user["hash"] = hash_row["value"] if hash_row else ""
         user["size"] = st.st_size
-        user["tags"] = [[t, c] for t, c in tags]
+        user["tags"] = [[t, c] for t, c in all_tags[:TAG_SHOW_LIMIT]]  # 锚点快照：默认前 24 个
         _save_card_json(safe, user)
+    # 标签池按「标签词显示」覆盖表裁剪/扩增：默认前 TAG_SHOW_LIMIT 个，显式显示的可突破上限
+    tags = visible_tags(all_tags, _tag_show_overrides(user))
 
     zh_map = user.get("translations")
     zh_map = zh_map.get("zh", {}) if isinstance(zh_map, dict) else {}
@@ -646,7 +673,8 @@ def model_tags(rel: str) -> dict:
     user = _get_card_data(safe)
     zh_map = user.get("translations")
     zh_map = zh_map.get("zh", {}) if isinstance(zh_map, dict) else {}
-    return {"ok": True, "rel": safe, "tags": build_tags(meta), "tag_translations": zh_map}
+    return {"ok": True, "rel": safe, "tags": build_tags(meta), "tag_translations": zh_map,
+            "tag_show": _tag_show_overrides(user), "tag_limit": TAG_SHOW_LIMIT}
 
 
 def folder_info(rel: str) -> dict:
@@ -891,7 +919,6 @@ def _resolve_llm_path(rel: str) -> Path | None:
 
 
 _llama_dll_ready = False
-_llm_import_error = ""   # 最近一次 import llama_cpp 的失败原因（供界面提示）
 _llm_last_note = ""      # 最近一次模型推理为何没产出译文（供界面提示）
 
 
@@ -950,20 +977,14 @@ def _prepare_llama_dll_env() -> None:
                 pass
 
 
-def _llm_engine_ready() -> bool:
-    global _llm_import_error
-    _prepare_llama_dll_env()
-    try:
-        import llama_cpp  # noqa: F401
-        _llm_import_error = ""
-        return True
-    except Exception as e:
-        _llm_import_error = str(e)
-        return False
-
-
 def _cuda_available() -> bool:
-    """当前安装的 llama_cpp 是否带 CUDA 后端（CPU 构建返回 False）。"""
+    """当前安装的 llama_cpp 是否带 CUDA 后端（CPU 构建返回 False）。
+
+    ⚠ 本函数会**在本进程内** import llama_cpp 并初始化 ggml CUDA 后端，因此只允许在
+    「即将真正加载模型」或「用户主动切换设备」这类主动路径上调用（`_get_llm` / `api_llm_gpu`）。
+    被动/高频路径（如 /llm_status 轮询、/llm_models 弹窗）请改用子进程版 `_probe_runtime()`，
+    否则仅刷新页面就会初始化 CUDA 后端——显存吃紧时（SD 常驻占满显存）是崩溃诱因。
+    """
     global _cuda_checked, _cuda_ok
     if _cuda_checked:
         return _cuda_ok
@@ -987,7 +1008,9 @@ def _llm_status() -> dict:
         return {
             "loaded": _llm is not None,
             "model": os.path.basename(_llm_path) if _llm_path else "",
-            "gpu": bool(_stats.get("llm_gpu")) and _cuda_available(),
+            # 只报「配置意图」，不做 CUDA 探测：本端点被前端每 15s 轮询，
+            # 探测会在进程内初始化 ggml CUDA 后端（显存吃紧时是崩溃诱因）
+            "gpu": bool(_stats.get("llm_gpu")),
             "auto_unload": bool(_stats.get("llm_auto_unload", True)),
             "idle_minutes": _clamp_idle_minutes(_stats.get("llm_idle_minutes", IDLE_MIN_DEFAULT)),
             "translate_mode": _translate_mode(),
@@ -1465,16 +1488,19 @@ _runtime_dl_state: dict[str, Any] = {
 
 
 def _probe_runtime(force: bool = False) -> dict:
-    """探测当前 llama-cpp-python 的构建类型与可用性。
+    """探测当前 llama-cpp-python 的构建类型与可用性（**唯一**被动的引擎探测入口）。
 
     必须放到子进程里执行：CUDA 版若缺少运行库，导入可能直接结束进程；
     同时也要能区分「装了但导不进来」（此时 CPU/GPU 都用不了）。
+    子进程继承本进程 env，故先补齐 CUDA 运行库 PATH（见 `_prepare_llama_dll_env`），
+    否则探测结论会与真正加载模型时不一致（把可用的 CUDA 轮子误判为不可用）。
     """
     with _runtime_probe_lock:
         cached = _runtime_probe_cache["value"]
         if not force and cached is not None and (time.time() - _runtime_probe_cache["at"]) < RUNTIME_PROBE_TTL:
             return cached
-    result = {"installed": False, "usable": False, "build": ""}
+    _prepare_llama_dll_env()
+    result = {"installed": False, "usable": False, "build": "", "error": ""}
     code = (
         "import llama_cpp;"
         "info=llama_cpp.llama_print_system_info();"
@@ -1488,8 +1514,11 @@ def _probe_runtime(force: bool = False) -> dict:
             result["installed"] = True
             result["usable"] = True
             result["build"] = "cuda" if "__LNA_CUDA__" in out else ("cpu" if "__LNA_CPU__" in out else "")
-    except Exception:
-        pass
+        else:
+            # 子进程导入失败/崩溃：留一段 stderr 供界面显示具体原因
+            result["error"] = (p.stderr or "").strip()[-300:]
+    except Exception as e:
+        result["error"] = str(e)
     if not result["installed"]:
         try:
             result["installed"] = importlib.util.find_spec("llama_cpp") is not None
@@ -1667,6 +1696,7 @@ _json_lock = threading.RLock()  # 可重入：读-改-写整体持锁，内层 _
 CARD_JSON_KEYS = (
     "hash", "size", "description", "base_model", "activation_text",
     "preferred_weight", "negative_text", "notes", "tags", "translations",
+    "tag_show",
 )
 
 
@@ -1743,7 +1773,7 @@ def _empty_card_data() -> dict:
     return {
         "hash": "", "size": 0, "description": "", "base_model": "Unknown",
         "activation_text": "", "preferred_weight": 0.0, "negative_text": "",
-        "notes": "", "tags": [], "translations": {},
+        "notes": "", "tags": [], "translations": {}, "tag_show": {},
     }
 
 
@@ -2615,13 +2645,16 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
 
     @app.get("/lora_new/api/llm_models")
     def api_llm_models():
+        # 引擎/设备探测走子进程（_probe_runtime）：不在本进程 import llama_cpp，
+        # 避免仅「打开设置弹窗」就初始化 ggml CUDA 后端（显存吃紧时是崩溃诱因）。
+        probe = _probe_runtime()
         return {
             "ok": True,
             "models": _scan_llm_models(),
             "selected": str(_stats.get("llm_model") or ""),
-            "engine_ready": _llm_engine_ready(),
-            "engine_error": _llm_import_error,
-            "cuda_available": _cuda_available(),
+            "engine_ready": bool(probe["usable"]),
+            "engine_error": str(probe.get("error") or ""),
+            "cuda_available": probe["build"] == "cuda",
             "gpu": bool(_stats.get("llm_gpu")),
             "loaded": _llm_path,
         }
@@ -2889,6 +2922,40 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             _save_stats()
         return {"ok": True}
 
+    @app.post("/lora_new/api/tag_show")
+    async def api_tag_show(payload: dict):
+        """设置某个标签是否在卡片设置的「数据集的训练标签」标签池中显示。
+
+        写入模型 JSON 的 tag_show 覆盖表；与默认规则（出现次数前 TAG_SHOW_LIMIT 个显示）一致时
+        不留覆盖，保持 JSON 干净。返回更新后的标签池列表，前端据此就地重绘。
+        """
+        rel = _safe_rel(payload.get("rel", ""))
+        tag = str(payload.get("tag", ""))
+        show = bool(payload.get("show", False))
+        if not rel:
+            return {"ok": False, "error": _t("err.invalidPath")}
+        if not tag:
+            return {"ok": False, "error": _t("err.tagEmpty")}
+        path = LORA_DIR / rel
+        if not path.is_file() or path.suffix.lower() not in LORA_EXTS:
+            return {"ok": False, "error": _t("err.fileNotFound")}
+        all_tags = build_tags(_read_safetensors_meta(path, rel))
+        idx = next((i for i, row in enumerate(all_tags) if row[0] == tag), -1)
+        if idx < 0:
+            return {"ok": False, "error": _t("err.tagNotFound")}
+        with _json_lock:
+            data = _get_card_data(rel)
+            over = _tag_show_overrides(data)
+            if show == (idx < TAG_SHOW_LIMIT):
+                over.pop(tag, None)  # 与默认规则一致 → 不写覆盖
+            else:
+                over[tag] = "show" if show else "hide"
+            data["tag_show"] = over
+            if not _save_card_json(rel, data):
+                return {"ok": False, "error": _t("err.writeJsonFailed")}
+        return {"ok": True, "rel": rel, "tag": tag, "show": show,
+                "tags": visible_tags(all_tags, over), "tag_limit": TAG_SHOW_LIMIT}
+
     @app.post("/lora_new/api/preview")
     async def api_preview(rel: str = "", file: UploadFile = File(...)):
         safe = _safe_rel(rel)
@@ -3061,6 +3128,17 @@ def _build_lora_new_page():
             pass
 
         def allowed_directories_for_previews(self):
+            return []
+
+        def list_items(self):
+            """返回空条目列表：本页卡片由插件自己的前端渲染，不走 Forge 的条目流水线。
+
+            必须显式覆写。基类实现是 `raise NotImplementedError()`，而它的 `str()` 是空串：
+            任何会遍历 extra_pages 并逐个调用 list_items() 的扩展（如
+            sd-webui-prompt-all-in-one）都会因此抛异常，表现为控制台打印一条内容为空的
+            「get_extra_networks error: 」；且该扩展的遍历写在一个 try 里，异常会中断循环，
+            导致其后注册的所有页面的条目一并被丢弃。
+            """
             return []
 
         def create_card_view_html(self, tabname, *, none_message):

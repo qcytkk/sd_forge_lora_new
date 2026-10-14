@@ -14,6 +14,7 @@
     metadata: '/lora_new/api/metadata',
     cardInfo: '/lora_new/api/card_info',
     modelTags: '/lora_new/api/model_tags',
+    tagShow: '/lora_new/api/tag_show',
     folderInfo: '/lora_new/api/folder_info',
     userMeta: '/lora_new/api/user_metadata',
     preview: '/lora_new/api/preview',
@@ -882,6 +883,7 @@
         <button class="lna-icon-btn lna-meta" type="button" aria-label="${esc(t('card.metaAria', { name: l.name }))}" title="${esc(t('card.metaTitle'))}">${ICON.info}</button>
         <button class="lna-icon-btn lna-cfg" type="button" aria-label="${esc(t('card.detailAria', { name: l.name }))}" title="${esc(t('card.cfgTitle'))}">${ICON.gear}<span>${t('card.cfgLabel')}</span></button>
       </div>
+      <button class="lna-del-btn" type="button" aria-label="${esc(t('card.delPromptAria', { name: l.name }))}">${t('card.delPromptLabel')}</button>
       <button class="lna-use-btn" type="button" aria-label="${esc(t('card.useAria', { name: l.name }))}">${t('card.useLabel')}</button>
     `;
     el.querySelector('.lna-copy').addEventListener('click', (e) => {
@@ -903,6 +905,10 @@
     el.querySelector('.lna-use-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       useLora(l);
+    });
+    el.querySelector('.lna-del-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeLoraPrompt(l);
     });
     el.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.target.closest('button')) {
@@ -3425,6 +3431,9 @@
     let page = 0;
     let pageSize = '50'; // 每页条数；'all' 表示全部显示在一页
     const zhMap = {};    // tag -> 中文译文（【翻译标签】按钮写入，第四列展示）
+    const dictMap = {};  // tag -> { found, value }：词典收录情况，决定【加入词典】按钮配色
+    const showMap = {};  // tag -> 'show'|'hide'：卡片设置标签池的显隐覆盖（缺省走默认规则）
+    let tagLimit = 24;   // 默认显示上限（后端下发，未主动设置时的可见标签个数）
     let translating = false;
 
     function pageRows() {
@@ -3437,6 +3446,22 @@
       return String(part || '').replace('{total}', String(total)).trim();
     }
 
+    // 每行「标签词显示」的当前状态：有显式覆盖按覆盖，否则按默认规则（出现次数前 tagLimit 个显示）
+    function isShown(tag, idx) {
+      const ov = showMap[tag];
+      return ov ? ov === 'show' : idx < tagLimit;
+    }
+
+    // 就地把某行的胶囊拨到目标状态（写入成功后调用，避免整表重绘）
+    function applyShowToRow(tr, tag, idx) {
+      const shown = isShown(tag, idx);
+      tr.querySelectorAll('.lna-show-switch .lna-zh-key').forEach((b) => {
+        const on = (b.dataset.show === '1') === shown;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+    }
+
     function renderPage() {
       const total = pages();
       if (page > total - 1) page = total - 1;
@@ -3444,15 +3469,23 @@
       const start = page * size;
       const rows = tags.slice(start, start + size).map(([tag, cnt], i) => {
         const zh = zhMap[tag];
+        const dcls = dictState(tag, zh);
+        const shown = isShown(tag, start + i);
         return `
         <tr>
           <td class="lna-alltags-index">${start + i + 1}</td>
           <td class="lna-alltags-tag" data-tag="${esc(tag)}">${esc(tag)}</td>
           <td class="lna-alltags-count">${esc(cnt)}</td>
           <td class="lna-alltags-zh">${zh && zh !== tag ? esc(zh) : ''}</td>
+          <td class="lna-alltags-show">
+            <div class="lna-zh-switch lna-show-switch" role="group" aria-label="${esc(t('cf.allTagsShowHint', { n: tagLimit }))}">
+              <button class="lna-zh-key${shown ? '' : ' active'}" type="button" data-show="0" aria-pressed="${shown ? 'false' : 'true'}">${t('cf.allTagsShowHide')}</button>
+              <button class="lna-zh-key${shown ? ' active' : ''}" type="button" data-show="1" aria-pressed="${shown ? 'true' : 'false'}">${t('cf.allTagsShowShow')}</button>
+            </div>
+          </td>
           <td class="lna-alltags-actions">
             <button class="dlg-btn dlg-action lna-alltags-edit" type="button">${t('cf.allTagsEdit')}</button>
-            <button class="dlg-btn dlg-action lna-alltags-dict" type="button">${t('cf.allTagsDict')}</button>
+            <button class="dlg-btn dlg-action lna-alltags-dict${dcls ? ' ' + dcls : ''}" type="button">${t('cf.allTagsDict')}</button>
           </td>
         </tr>`;
       }).join('');
@@ -3464,6 +3497,7 @@
               <th>${t('cf.allTagsColTag')}</th>
               <th>${t('cf.allTagsColCount')}</th>
               <th>${t('cf.allTagsColZh')}</th>
+              <th>${t('cf.allTagsColShow')}</th>
               <th>${t('cf.allTagsColActions')}</th>
             </tr></thead>
             <tbody>${rows}</tbody>
@@ -3536,6 +3570,42 @@
         const zh = zhMap[tagTd.dataset.tag];
         zhTd.textContent = zh && zh !== tagTd.dataset.tag ? zh : '';
       });
+    }
+
+    // 【加入词典】按钮配色状态：词典已收录且有译文 → 与当前译文一致为 is-matched(绿)、不同为 is-diff(黄)；
+    // 未收录（或收录但无值）→ ''（灰白默认）。无当前译文时一律视为「有差异」。
+    function dictState(tag, zh) {
+      const d = dictMap[tag];
+      if (!d || !d.found || !d.value) return '';
+      const cur = zh && zh !== tag ? normZh(zh) : '';
+      return (cur && normZh(d.value) === cur) ? 'is-matched' : 'is-diff';
+    }
+
+    // 就地刷新当前页按钮配色（批量匹配返回后调用，避免整表重绘）
+    function applyDictToRows() {
+      body.querySelectorAll('tbody tr').forEach((tr) => {
+        const tagTd = tr.querySelector('.lna-alltags-tag');
+        const btn = tr.querySelector('.lna-alltags-dict');
+        if (!tagTd || !btn) return;
+        const st = dictState(tagTd.dataset.tag, zhMap[tagTd.dataset.tag]);
+        btn.classList.toggle('is-matched', st === 'is-matched');
+        btn.classList.toggle('is-diff', st === 'is-diff');
+      });
+    }
+
+    // 打开弹窗时批量匹配词典（一次请求全部标签）：决定【加入词典】按钮配色；失败则保持灰白
+    async function loadDictStates() {
+      try {
+        const r = await fetch(API.dictCheck, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tags: tags.map((x) => x[0]) }),
+        });
+        const res = await r.json();
+        if (closed || !document.contains(dlg) || !res || !res.ok || !res.dict) return;
+        Object.assign(dictMap, res.dict);
+        applyDictToRows();
+      } catch (e) { /* 匹配失败：保持默认灰白配色 */ }
     }
 
     // 单批请求：撞上其它标签页正在翻译时，等全局空闲后重试一次；失败返回 null
@@ -3613,8 +3683,62 @@
       const tagTd = tr && tr.querySelector('.lna-alltags-tag');
       const tag = tagTd ? tagTd.dataset.tag : '';
       if (!tag) return;
-      if (editBtn) openAllTagsEditDialog(tag, rel, zhMap, mainBody, applyZhToRows);
-      else openAllTagsDictDialog(tag, zhMap);
+      if (editBtn) {
+        // 改译后：译文列与词典配色都要重算（译文变化会影响「与词典一致/有差异」的判定）
+        openAllTagsEditDialog(tag, rel, zhMap, mainBody, () => {
+          applyZhToRows();
+          applyDictToRows();
+        });
+      } else {
+        openAllTagsDictDialog(tag, zhMap, () => {
+          // 入库成功 → 该标签词典值即当前译文，按钮应变为绿色
+          dictMap[tag] = { found: true, value: zhMap[tag] || '' };
+          applyDictToRows();
+        });
+      }
+    });
+
+    // 「标签词显示」胶囊：写入该模型 JSON 的显隐覆盖表，并让卡片设置的标签池就地跟随。
+    // 同样用 body 级委托（行会随翻页重绘）。写入期间禁用该行两个按钮，避免并发重复提交。
+    body.addEventListener('click', async (e) => {
+      const key = e.target.closest('.lna-show-switch .lna-zh-key');
+      if (!key || key.disabled) return;
+      const tr = key.closest('tr');
+      const tagTd = tr && tr.querySelector('.lna-alltags-tag');
+      const tag = tagTd ? tagTd.dataset.tag : '';
+      if (!tag) return;
+      const idx = tags.findIndex((x) => x[0] === tag);
+      const show = key.dataset.show === '1';
+      if (isShown(tag, idx) === show) return; // 已是目标状态，无需请求
+      const keys = tr.querySelectorAll('.lna-show-switch .lna-zh-key');
+      keys.forEach((b) => { b.disabled = true; });
+      try {
+        const r = await fetch(API.tagShow, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rel: rel || '', tag, show }),
+        });
+        const res = await r.json();
+        if (!document.contains(dlg)) return; // 弹窗已关闭
+        if (!res || !res.ok) {
+          flashToast(t('toast.saveFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
+          return;
+        }
+        // 与默认规则一致时不留覆盖（与后端保持同一口径）
+        if (show === (idx < tagLimit)) delete showMap[tag];
+        else showMap[tag] = show ? 'show' : 'hide';
+        applyShowToRow(tr, tag, idx);
+        // 卡片设置弹窗的标签池跟随刷新（可见列表由后端算好，可突破默认上限）
+        if (mainBody && document.contains(mainBody) && mainBody.__lnaSetPoolTags) {
+          mainBody.__lnaSetPoolTags(res.tags);
+        }
+      } catch (err) {
+        if (document.contains(dlg)) {
+          flashToast(t('toast.saveFailed', { msg: t('toast.unknownError') }), true);
+        }
+      } finally {
+        if (document.contains(dlg)) keys.forEach((b) => { b.disabled = false; });
+      }
     });
 
     (async () => {
@@ -3632,8 +3756,12 @@
         Object.keys(tr).forEach((k) => {
           if (tr[k] && tr[k] !== k) zhMap[k] = tr[k];
         });
+        // 显隐覆盖表 + 默认上限：决定「标签词显示」胶囊的初始状态
+        Object.assign(showMap, res.tag_show || {});
+        if (Number(res.tag_limit) > 0) tagLimit = Number(res.tag_limit);
         if (!tags.length) { showEmpty(t('cf.allTagsEmpty'), false); return; }
         renderPage();
+        loadDictStates(); // 异步批量匹配词典，决定【加入词典】按钮配色
       } catch (e) {
         if (closed || !document.contains(dlg)) return;
         showEmpty(t('cf.allTagsLoadFailed'), true);
@@ -3730,7 +3858,7 @@
 
   // ---------- 查看所有标签：单标签【加入词典】弹窗 ----------
   // 针对一个固定单词：查询词典（已收录→替换 / 未收录→添加），写入内容取该标签当前译文。
-  function openAllTagsDictDialog(tag, zhMap) {
+  function openAllTagsDictDialog(tag, zhMap, onSaved) {
     if (document.querySelector('.lna-alltags-dict-mask')) return; // 已打开，忽略重复点击
     const zhText = zhMap[tag] && zhMap[tag] !== tag ? zhMap[tag] : '';
     const mask = document.createElement('div');
@@ -3815,6 +3943,7 @@
           if (!document.contains(dlg)) return;
           if (res && res.ok) {
             flashToast(lookup.found ? t('tag.replacedDictToast', { tag }) : t('tag.addedDictToast', { tag }));
+            if (onSaved) onSaved();
             renderResult({ ok: true, key: res.key, found: true, dict_value: res.value });
           } else {
             flashToast(t('tag.writeFailed', { msg: (res && res.error) || t('toast.unknownError') }), true);
@@ -4092,26 +4221,44 @@
     }
     act.addEventListener('input', syncTagSelected);
     syncTagSelected(); // 打开弹窗时按已保存的触发词初始化选中态
-    body.querySelectorAll('.lna-tag').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const tag = btn.dataset.tag;
-        const key = normTag(tag);
-        const words = actWords();
-        // 归一化比较：等价写法（下划线/空格、大小写、多空白）视为同一标签
-        const kept = words.filter((w) => normTag(w) !== key);
-        if (kept.length !== words.length) {
-          act.value = kept.join(', ');             // 已存在 → 移出（连同重复项与异形写法一并清掉）
-        } else {
-          act.value = kept.concat(tag).join(', '); // 不存在 → 追加标签原文
-        }
-        syncTagSelected(); // 程序改 value 不触发 input 事件，手动同步
+    // 点标签 → 加入/移出触发词。标签池会随【标签词显示】开关重绘，故抽成函数，重绘后再绑一次。
+    function bindPoolTagClicks() {
+      body.querySelectorAll('.lna-tag').forEach((btn) => {
+        if (btn.__lnaBound) return;
+        btn.__lnaBound = true;
+        btn.addEventListener('click', () => {
+          const tag = btn.dataset.tag;
+          const key = normTag(tag);
+          const words = actWords();
+          // 归一化比较：等价写法（下划线/空格、大小写、多空白）视为同一标签
+          const kept = words.filter((w) => normTag(w) !== key);
+          if (kept.length !== words.length) {
+            act.value = kept.join(', ');             // 已存在 → 移出（连同重复项与异形写法一并清掉）
+          } else {
+            act.value = kept.concat(tag).join(', '); // 不存在 → 追加标签原文
+          }
+          syncTagSelected(); // 程序改 value 不触发 input 事件，手动同步
+        });
       });
-    });
+    }
+    bindPoolTagClicks();
+
+    // 「查看模型所有标签」里的【标签词显示】开关会改变标签池内容：由该弹窗经
+    // body.__lnaSetPoolTags 回调重绘（可见列表由后端按覆盖表算好，可突破默认上限）。
+    const tagsBox = body.querySelector('.lna-cf-tags');
+    body.__lnaSetPoolTags = (list) => {
+      info.tags = Array.isArray(list) ? list : [];
+      if (!tagsBox) return;
+      tagsBox.innerHTML = tagsHtml(info.tags);
+      bindPoolTagClicks();
+      syncTagSelected();                                // 重绘后恢复触发词的选中态
+      applyTagTranslations(body, body.__lnaZhMap || {}); // 重绘后回填已持久化的译文
+    };
 
     // 训练标签的中文翻译：连体胶囊开关（隐藏/显示）与批量翻译
     const zhKeys = body.querySelectorAll('.lna-zh-key');
     const zhAll = body.querySelector('.lna-cf-zh-all');
-    const tagList = (info.tags || []).map(([t]) => t);
+    const tagListNow = () => (info.tags || []).map((x) => x[0]); // 随标签池重绘实时变化
     // 打开弹窗只展示 JSON 里已持久化的对照（不发任何请求）；
     // 无对照的标签显示「未完成翻译」占位，翻译仅由【翻译所有标签】按钮显式触发
     applyTagTranslations(body, info.tag_translations || {});
@@ -4181,7 +4328,7 @@
     }
 
     bindZhButton(zhAll, '.lna-zh-all-label', t('cf.translateAllLabel'),
-      () => tagList, t('cf.noTagsMsg'));
+      () => tagListNow(), t('cf.noTagsMsg'));
     // 只提交当前显示为「未完成翻译」的标签：词典/缓存已命中的不再重复送模型
     bindZhButton(body.querySelector('.lna-cf-zh-missing'), '.lna-zh-missing-label', t('cf.translateMissingLabel'),
       () => Array.from(body.querySelectorAll('.lna-tag.no-zh')).map((el) => el.dataset.tag),
@@ -4510,6 +4657,100 @@
     setter.call(ta, cur + sep + text);
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     ta.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // ---------- 删除 Lora 提示词（撤销【使用 Lora 提示词】加入的内容）----------
+  // 与 useLora 同源：用同一份卡片资料重算「<lora:name:权重> 触发词」，
+  // 优先整段精确移除（空白宽松匹配），失败则退化到按名字移除任意权重的 <lora:name:...> 标签。
+  function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  // 收尾清理：折叠多余空格与连续逗号，去掉首尾遗留的分隔符
+  function tidyPrompt(s) {
+    return String(s)
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/(?:\s*,\s*){2,}/g, ', ')
+      .replace(/^[\s,]+/, '')
+      .replace(/[\s,]+$/, '');
+  }
+
+  // 以原生 setter 写回并派发 input/change，确保 Forge 侧能读到更新后的提示词
+  function setPromptValue(ta, value) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(ta, value);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    ta.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // 从指定提示词框移除该 Lora 的提示词片段；返回是否有内容被移除。
+  // 正确逻辑（参考内置 sd_forge_lora：它把整个「触发词」原样拼在标签后，用户之后可能自行改写/调序）：
+  //   1) 删除任意权重的 <lora:名字:...> 标签；
+  //   2) 把卡片「触发词」字段（会和 Lora 一起添加）按逗号拆成单词，逐个从提示词框移除——
+  //      每个词按完整片段匹配（前后为逗号/空白/首尾），既不依赖整串顺序，也不会误删子串。
+  function removeLoraPromptFrom(selector, name, activation) {
+    const box = document.querySelector(selector);
+    const ta = box && box.querySelector('textarea');
+    if (!ta) return false;
+    let next = ta.value || '';
+    if (!next) return false;
+    let hit = false;
+    // 用「替换前后是否变化」判定命中，避开 /g 正则 lastIndex 的状态问题
+    const apply = (re, rep) => {
+      const before = next;
+      next = next.replace(re, rep);
+      if (next !== before) hit = true;
+    };
+    // 1) 标签本身（权重任意）
+    apply(new RegExp('<lora:' + escapeRegExp(name) + ':[^>]*>', 'gi'), '');
+    // 2) 触发词逐词移除
+    String(activation || '')
+      .split(/[,，\n]/)
+      .map((w) => w.trim())
+      .filter(Boolean)
+      .forEach((w) => {
+        const part = escapeRegExp(w).replace(/\s+/g, '\\s+');
+        apply(new RegExp('(^|[\\s,]+)' + part + '([\\s,]+|$)', 'gi'), ', ');
+      });
+    if (!hit) return false;
+    setPromptValue(ta, tidyPrompt(next));
+    return true;
+  }
+
+  // 负提示词按字面移除；只认完整片段（前后为逗号/空白/首尾），避免误删子串
+  function removeTextFromPrompt(selector, text) {
+    const box = document.querySelector(selector);
+    const ta = box && box.querySelector('textarea');
+    if (!ta || !text) return false;
+    const cur = ta.value || '';
+    if (!cur) return false;
+    const re = new RegExp('(^|[\\s,]+)' + escapeRegExp(text).replace(/\s+/g, '\\s+') + '([\\s,]+|$)', 'g');
+    const next = cur.replace(re, ', ');
+    if (next === cur) return false;
+    setPromptValue(ta, tidyPrompt(next));
+    return true;
+  }
+
+  async function removeLoraPrompt(l) {
+    // 读卡片资料用只读的 card_info（不用会累加使用次数的 /use）
+    let info = {};
+    try {
+      const r = await fetch(`${API.cardInfo}?rel=${encodeURIComponent(l.rel)}`);
+      info = await r.json();
+    } catch (e) {}
+    const u = (info && info.user) || {};
+    const activation = String(u.activation_text || '').trim() || String(l.trigger || '').trim();
+    const negative = String(u.negative_text || '').trim();
+    const root = getActiveRoot();
+    const tabitem = root ? root.closest('.tabitem') : null;
+    const isImg2Img = tabitem && tabitem.id.indexOf('img2img') >= 0;
+    const tabName = isImg2Img ? 'img2img' : 'txt2img';
+    let removed = removeLoraPromptFrom(`#${tabName}_prompt`, l.name, activation);
+    if (negative) {
+      removed = removeTextFromPrompt(`#${tabName}_neg_prompt`, negative) || removed;
+    }
+    if (!removed) { flashToast(t('card.delPromptNone'), true); return; }
+    flashToast(t('card.delPromptDone', { tab: tabName }));
   }
 
   // ---------- 无障碍详情弹窗 ----------
