@@ -93,7 +93,7 @@ pip install llama-cpp-python
 | `models_json_data/` | 每个 LoRA 的卡片资料（镜像你的 LoRA 目录结构） |
 | `__pycache__/` | Python 字节码缓存 |
 
-> `data/group_tags.zh_CN.csv` 是通用英中标签词典（静态资源），随仓库分发。
+> `data/en_zh_dictionary.csv` 是通用英中标签词典（静态资源，约 10.8 万条，首行为表头「英文,中文」），随仓库分发。
 
 ## 目录结构
 
@@ -106,12 +106,12 @@ sd_forge_lora_new/
 ├── lna_lora_engine/          # 自带的 <lora:> 解析引擎
 ├── lna_i18n/                 # 界面多语言（locales/ 语言包 + 后端实现）
 ├── docs/images/              # README 截图
-├── data/                     # 运行时数据（group_tags.zh_CN.csv 为静态词典）
+├── data/                     # 运行时数据（en_zh_dictionary.csv 为静态英中词典）
 └── .gitignore
 ```
 
 ## 致谢与许可
 
-- 英中标签词典数据源自 [sd-webui-prompt-all-in-one](https://github.com/Physton/sd-webui-prompt-all-in-one)。
+- 英中标签词典由两部分合成：主体为 danbooru 中文标签表（SFW，经去重 / 超长精简 / 语义核查等修正），并与源自 [sd-webui-prompt-all-in-one](https://github.com/Physton/sd-webui-prompt-all-in-one) 的旧版词典合并（重叠项以旧版译文为准）。
 - `lna_lora_engine/` 移植自 Forge 内置的 `extensions-builtin/sd_forge_lora`。
 - 本项目遵循 **AGPL-3.0** 许可协议，详见 [LICENSE](LICENSE)。

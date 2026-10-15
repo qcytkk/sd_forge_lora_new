@@ -43,11 +43,11 @@ DATA_DIR = EXT_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 STATS_FILE = DATA_DIR / "stats.json"
 # 标签翻译：两级对照
-# 1) group_tags.zh_CN.csv  由 sd-webui-prompt-all-in-one 插件的 group_tags/zh_CN.yaml
-#                          生成（按人物/服饰/表情等分类整理，译文干净；同义词串只取首段，
-#                          不可信值不收录），命中即用
+# 1) en_zh_dictionary.csv  英中标签对照词典（data/ 下的静态资源，随仓库分发），
+#                          首行为表头「英文,中文」（由 _load_tag_dict 跳过），其余每行
+#                          「英文标签,中文译文」，命中即用
 # 2) 未收录标签            → GGUF 模型实时翻译（结果缓存）
-DICT_FILE = DATA_DIR / "group_tags.zh_CN.csv"
+DICT_FILE = DATA_DIR / "en_zh_dictionary.csv"
 TRANSLATIONS_FILE = DATA_DIR / "translations.json"
 # 卡片设置资料：按模型存 JSON（镜像 LoRA 目录结构，文件名加 _new 后缀）。
 # 预览图像不进 JSON，仍与模型同目录同名存放（与旧版一致）。
@@ -777,15 +777,23 @@ def _dict_value_questionable(value: str) -> bool:
     return False
 
 
+def _is_dict_header(row: list) -> bool:
+    """判断一行是否为词典表头（如「英文,中文」），加载时跳过，避免误当成词条。"""
+    if len(row) < 2:
+        return False
+    a, b = row[0].strip(), row[1].strip()
+    return a in ("英文", "English", "en", "tag", "标签") and b in ("中文", "Chinese", "zh", "译文")
+
+
 def _load_tag_dict() -> None:
     global _dict_loaded
     if _dict_loaded:
         return
     _dict_loaded = True
     try:
-        with DICT_FILE.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+        with DICT_FILE.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
             for row in csv.reader(f):
-                if len(row) < 2:
+                if len(row) < 2 or _is_dict_header(row):
                     continue
                 key = _normalize_tag(row[0])
                 val = " ".join(str(row[1]).split())  # 折叠多余空白
@@ -816,7 +824,7 @@ def _dict_upsert(tag: str, value: str) -> dict:
         rows: list[list[str]] = []
         try:
             if DICT_FILE.exists():
-                with DICT_FILE.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+                with DICT_FILE.open("r", encoding="utf-8-sig", errors="ignore", newline="") as f:
                     rows = [r for r in csv.reader(f) if r]
         except Exception as e:
             return {"ok": False, "error": _t("err.readDictFailed", msg=e)}
