@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import csv
-import importlib.util
 import json
 import os
 import re
@@ -12,8 +11,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -53,28 +50,8 @@ TRANSLATIONS_FILE = DATA_DIR / "translations.json"
 # 预览图像不进 JSON，仍与模型同目录同名存放（与旧版一致）。
 JSON_DATA_DIR = EXT_DIR / "models_json_data"
 
-# LLM（GGUF）模型目录：<models>/LLM，不存在则自动创建
-try:
-    from modules import paths as _paths
-    LLM_DIR = Path(_paths.models_path) / "LLM"
-except Exception:
-    LLM_DIR = EXT_DIR / "models" / "LLM"
-try:
-    LLM_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
-# 翻译运行时（llama-cpp-python）随插件分发的 CPU 轮子目录；
-# wheels/cuda/ 存放用户在设置里按需下载的 CUDA 轮子（两处轮子文件名相同，靠目录区分）
-WHEELS_DIR = EXT_DIR / "wheels"
-CUDA_WHEELS_DIR = WHEELS_DIR / "cuda"
-RUNTIME_VERSION = "0.3.36"  # 与随插件分发的 CPU 轮子保持一致
-CUDA_WHEEL_NAME = f"llama_cpp_python-{RUNTIME_VERSION}-py3-none-win_amd64.whl"
-CUDA_WHEEL_URL = (
-    f"https://github.com/abetlen/llama-cpp-python/releases/download/"
-    f"v{RUNTIME_VERSION}-cu124/{CUDA_WHEEL_NAME}"
-)
-MIN_CUDA_DRIVER = (527, 41)  # cu124 要求的最低 NVIDIA 驱动版本
+# LLM（GGUF）模型目录与翻译运行时（llama-cpp-python 轮子）由共享服务统一管理，
+# 见文件末尾「本地 LLM 翻译（共享服务）」一节
 
 # LoRA 目录
 try:
@@ -86,18 +63,13 @@ except Exception:
 LORA_EXTS = {".safetensors", ".ckpt", ".pt"}
 
 # ---------- 统计数据持久化 ----------
+# 注意：LLM 模型/设备/空闲卸载/翻译方案/提示预设不在这里，统一放在共享服务的
+# data/llm_shared.json（lna_llm_service），两个插件共用一套。
 _stats: dict[str, Any] = {
     "usage_count": {},
     "last_viewed": {},
     "custom_previews": {},
     "user_metadata": {},
-    "llm_model": "",   # 标签翻译选中的 GGUF 模型（LLM_DIR 下的相对路径）
-    "llm_gpu": False,  # False=CPU 推理（默认，不与 SD 抢显存）；True=GPU 加速
-    "llm_auto_unload": True,   # 空闲时自动卸载模型，释放显存/内存
-    "llm_idle_minutes": 5,     # 空闲多久后卸载（分钟，范围见 IDLE_MIN/MAX）
-    "translate_mode": "hybrid",  # 翻译方案：dict=仅用对照表 / llm=仅用模型 / hybrid=混合
-    "prompt_presets": {},      # 翻译提示预设：{预设名: 提示文本}
-    "active_prompt": "",       # 当前启用的提示预设名（空 = 内置默认预设）
 }
 
 
@@ -696,27 +668,49 @@ def folder_info(rel: str) -> dict:
     }
 
 
-# ---------- 标签翻译（词典优先 + opus-mt 兜底） ----------
-_tag_dict: dict[str, str] = {}   # 归一化英文标签 → 中文
-_dict_loaded = False
-_trans_cache: dict[str, dict[str, str]] = {}  # 模型名 → {标签: 译文}，避免重复推理
-_trans_loaded = False
-_llm = None          # 当前已加载的 llama_cpp.Llama 实例
-_llm_path = ""       # 该实例对应的模型绝对路径
-_llm_load_error = ""
-_cuda_checked = False  # CUDA 后端探测结果缓存（进程内只查一次）
-_cuda_ok = False
-_llm_lock = threading.RLock()  # llama_cpp 非线程安全：加载/推理/卸载全程串行，防并发 segfault
-_llm_last_used = 0.0           # 上次推理完成的时间戳；空闲卸载据此计时
-_watchdog_started = False      # 守护线程只启动一次
-# 全局翻译任务标记（跨浏览器标签页共享同一后端，防重复发起）
-_translate_state: dict[str, Any] = {"busy": False}
-_translate_state_lock = threading.Lock()
+# ---------- 本地 LLM 翻译（共享服务） ----------
+# 实现位于插件根目录的 lna_llm_service 包：sd_forge_lora_new 与
+# sd-webui-prompt-all-in-one-forge 共用同一份模块对象（单实例 / 一把锁 / 一个卸载守护线程）。
+# 导入失败时 _llm 为 None：标签翻译退化为「仅对照表」，设置弹窗给出运行时未就绪提示。
+try:
+    from lna_llm_service import core as _llm
+except Exception:
+    _llm = None
+
+# 译文缓存写回本插件原有的 translations.json（保持既有数据继续可用）
+if _llm is not None:
+    try:
+        _llm.set_translation_cache_file(TRANSLATIONS_FILE)
+    except Exception:
+        pass
+
+
+def _llm_status() -> dict:
+    """当前模型加载状态（供前端状态按钮轮询；不做 CUDA 探测，避免被动初始化后端）。"""
+    if _llm is None:
+        return {
+            "loaded": False, "model": "", "gpu": False, "auto_unload": True,
+            "idle_minutes": 5, "translate_mode": "hybrid", "last_used": 0,
+        }
+    st = _llm.status()
+    return {
+        "loaded": bool(st.get("loaded")),
+        "model": st.get("model", ""),
+        "gpu": bool(st.get("gpu")),
+        "auto_unload": bool(st.get("auto_unload")),
+        "idle_minutes": st.get("idle_minutes", 5),
+        "translate_mode": st.get("translate_mode", "hybrid"),
+        "last_used": st.get("last_used", 0),
+    }
+
+
+def _unload_llm() -> bool:
+    return bool(_llm.unload()) if _llm is not None else False
+
 
 IDLE_MIN_DEFAULT = 5   # 空闲卸载默认时长（分钟）
 IDLE_MIN = 3           # 下限
 IDLE_MAX = 200         # 上限
-IDLE_POLL_SECONDS = 10  # 守护线程检查间隔
 
 
 def _clamp_idle_minutes(value: Any) -> int:
@@ -741,6 +735,8 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _NAME_CHUNK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’.\-!&+ ]*")
 
 DICT_MAX_LEN = 20   # 超过此长度视为多段串接
+_tag_dict: dict[str, str] = {}   # 归一化英文标签 → 中文
+_dict_loaded = False
 
 
 def _dict_value_questionable(value: str) -> bool:
@@ -854,844 +850,35 @@ def _dict_upsert(tag: str, value: str) -> dict:
         return {"ok": True, "key": key, "value": val, "replaced": replaced}
 
 
-def _load_trans_cache() -> None:
-    global _trans_loaded
-    if _trans_loaded:
-        return
-    _trans_loaded = True
-    if not TRANSLATIONS_FILE.exists():
-        return
-    try:
-        data = json.loads(TRANSLATIONS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            for model, mapping in data.items():
-                if isinstance(mapping, dict):
-                    _trans_cache[str(model)] = {str(k): str(v) for k, v in mapping.items()}
-    except Exception:
-        pass
-
-
-def _save_trans_cache() -> None:
-    try:
-        TRANSLATIONS_FILE.write_text(
-            json.dumps(_trans_cache, ensure_ascii=False, indent=0), encoding="utf-8"
-        )
-    except Exception:
-        pass
-
-
-def _scan_llm_models() -> list[dict]:
-    """递归扫描 LLM 目录下的所有 .gguf 模型。"""
-    out: list[dict] = []
-    try:
-        LLM_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return out
-    try:
-        for p in sorted(LLM_DIR.rglob("*.gguf")):
-            try:
-                if not p.is_file():
-                    continue
-                st = p.stat()
-            except Exception:
-                continue
-            out.append({
-                "name": p.name,
-                "rel": str(p.relative_to(LLM_DIR)).replace("\\", "/"),
-                "size": st.st_size,
-                "modified": st.st_mtime,
-            })
-    except Exception:
-        pass
-    return out
-
-
-def _resolve_llm_path(rel: str) -> Path | None:
-    """把 LLM 目录下的相对路径解析为绝对路径，阻止目录穿越与越界。"""
-    if not rel:
-        return None
-    parts = [s for s in str(rel).replace("\\", "/").split("/") if s not in ("", ".")]
-    if not parts or any(s == ".." for s in parts):
-        return None
-    p = LLM_DIR.joinpath(*parts)
-    try:
-        if p.resolve().parent == LLM_DIR.resolve():
-            pass
-        # 必须位于 LLM_DIR 之内，且为 .gguf 文件
-        p.resolve().relative_to(LLM_DIR.resolve())
-    except Exception:
-        return None
-    if p.suffix.lower() != ".gguf":
-        return None
-    return p
-
-
-_llama_dll_ready = False
-_llm_last_note = ""      # 最近一次模型推理为何没产出译文（供界面提示）
-
-
-def _prepare_llama_dll_env() -> None:
-    """把 CUDA 运行库所在目录并入 PATH，供 CUDA 版 llama.dll / ggml-cuda.dll 加载依赖（只做一次）。
-
-    官方 CUDA 轮子**不自带** cudart/cublas，必须从外部找到它们，否则 import llama_cpp
-    会因 llama.dll 加载失败抛 RuntimeError（表现为插件误报「未检测到 llama_cpp 模块」，
-    或下载好的 CUDA 版被判为不可用）。搜索顺序：
-
-    1) WebUI 自带 torch 的 lib 目录（含 CUDA 12 的 cudart64_12 / cublas64_12 / cublasLt64_12）
-       —— 覆盖绝大多数用户，无需额外安装 CUDA Toolkit；
-    2) CUDA_PATH / CUDA_HOME 指向的 bin；
-    3) C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\* 的 bin（版本倒序）。
-
-    这一步让插件不依赖启动环境（从桌面快捷方式启动、CUDA 未加入系统 PATH 都能正常工作）。
-    """
-    global _llama_dll_ready
-    if _llama_dll_ready:
-        return
-    _llama_dll_ready = True
-    if os.name != "nt":
-        return
-    dirs: list[str] = []
-    # WebUI 自带的 torch 里带有 CUDA 12 运行库（cudart64_12 / cublas64_12 / cublasLt64_12），
-    # 正是 llama-cpp-python 的 CUDA 轮子（cu124）所依赖的——官方轮子不自带这些 DLL。
-    # 优先用它，用户就不必另外安装 CUDA Toolkit 也能加载 CUDA 版轮子。
-    try:
-        import torch
-        tlib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        if os.path.isdir(tlib):
-            dirs.append(tlib)
-    except Exception:
-        pass
-    for env in ("CUDA_PATH", "CUDA_HOME"):
-        base = os.environ.get(env)
-        if base:
-            dirs += [os.path.join(base, "bin", "x64"), os.path.join(base, "bin")]
-    root = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-    try:
-        # 版本目录倒序：优先使用最新的 CUDA（如 v13.1 优先于 v12.4）
-        def _ver_key(name: str):
-            return tuple(int(x) for x in re.findall(r"\d+", name)) or (0,)
-
-        for ver in sorted(os.listdir(root), key=_ver_key, reverse=True):
-            dirs += [os.path.join(root, ver, "bin", "x64"), os.path.join(root, ver, "bin")]
-    except Exception:
-        pass
-    dirs = [d for d in dirs if os.path.isdir(d)]
-    if dirs:
-        os.environ["PATH"] = os.pathsep.join(dirs + [os.environ.get("PATH", "")])
-        for d in dirs:
-            try:
-                os.add_dll_directory(d)
-            except Exception:
-                pass
-
-
-def _cuda_available() -> bool:
-    """当前安装的 llama_cpp 是否带 CUDA 后端（CPU 构建返回 False）。
-
-    ⚠ 本函数会**在本进程内** import llama_cpp 并初始化 ggml CUDA 后端，因此只允许在
-    「即将真正加载模型」或「用户主动切换设备」这类主动路径上调用（`_get_llm` / `api_llm_gpu`）。
-    被动/高频路径（如 /llm_status 轮询、/llm_models 弹窗）请改用子进程版 `_probe_runtime()`，
-    否则仅刷新页面就会初始化 CUDA 后端——显存吃紧时（SD 常驻占满显存）是崩溃诱因。
-    """
-    global _cuda_checked, _cuda_ok
-    if _cuda_checked:
-        return _cuda_ok
-    _prepare_llama_dll_env()
-    try:
-        import llama_cpp
-        info = llama_cpp.llama_print_system_info()
-        if isinstance(info, bytes):
-            info = info.decode("utf-8", errors="ignore")
-        _cuda_ok = "CUDA" in str(info)
-        _cuda_checked = True
-    except Exception:
-        # 导入失败不写死结论：可能是环境未就绪，留待后续重试
-        _cuda_ok = False
-    return _cuda_ok
-
-
-def _llm_status() -> dict:
-    """当前模型加载状态，供前端状态按钮使用。"""
-    with _llm_lock:
-        return {
-            "loaded": _llm is not None,
-            "model": os.path.basename(_llm_path) if _llm_path else "",
-            # 只报「配置意图」，不做 CUDA 探测：本端点被前端每 15s 轮询，
-            # 探测会在进程内初始化 ggml CUDA 后端（显存吃紧时是崩溃诱因）
-            "gpu": bool(_stats.get("llm_gpu")),
-            "auto_unload": bool(_stats.get("llm_auto_unload", True)),
-            "idle_minutes": _clamp_idle_minutes(_stats.get("llm_idle_minutes", IDLE_MIN_DEFAULT)),
-            "translate_mode": _translate_mode(),
-            "last_used": _llm_last_used,
-        }
-
-
-def _unload_llm() -> bool:
-    """释放模型实例；已卸载时直接返回 False（幂等，重复调用不报错）。"""
-    global _llm, _llm_path
-    with _llm_lock:  # 卸载同样持锁：不能在别的线程推理中途释放 C++ 对象
-        if _llm is None:
-            _llm_path = ""
-            return False
-        try:
-            _llm.close()
-        except Exception:
-            pass
-        _llm = None
-        _llm_path = ""
-        return True
-
-
-def _idle_watchdog() -> None:
-    """后台守护线程：翻译空闲超过阈值后自动卸载模型，释放显存/内存。"""
-    while True:
-        time.sleep(IDLE_POLL_SECONDS)
-        try:
-            if _llm is None:
-                continue  # 已卸载，无需处理（避免重复卸载）
-            if not bool(_stats.get("llm_auto_unload", True)):
-                continue  # 用户选择永不卸载
-            with _translate_state_lock:
-                if _translate_state["busy"]:
-                    continue  # 正在翻译（含其它标签页发起），不要抢占释放
-            minutes = _clamp_idle_minutes(_stats.get("llm_idle_minutes", IDLE_MIN_DEFAULT))
-            if _llm_last_used and (time.time() - _llm_last_used) >= minutes * 60:
-                _unload_llm()
-        except Exception:
-            pass  # 守护线程绝不因单次异常退出
-
-
-def _ensure_watchdog() -> None:
-    global _watchdog_started
-    if _watchdog_started:
-        return
-    _watchdog_started = True
-    threading.Thread(target=_idle_watchdog, daemon=True, name="lna-idle-unload").start()
-
-
-def _get_llm():
-    """按当前选中的模型惰性加载 llama_cpp.Llama；失败返回 None（调用方回退词典）。"""
-    global _llm, _llm_path, _llm_load_error, _llm_last_used
-    rel = str(_stats.get("llm_model") or "")
-    if not rel:
-        return None
-    path = _resolve_llm_path(rel)
-    if path is None or not path.is_file():
-        _llm_load_error = _t("llm.status.modelMissing")
-        return None
-    with _llm_lock:
-        if _llm is not None and _llm_path == str(path):
-            _llm_last_used = time.time()  # 命中已加载实例：刷新空闲计时
-            return _llm
-        _unload_llm()  # 切换了模型：先释放旧的，避免显存/内存堆积
-        # GPU 开关：开且构建支持 CUDA 时全部层进显存；否则纯 CPU（n_gpu_layers=0）
-        use_gpu = bool(_stats.get("llm_gpu")) and _cuda_available()
-        _prepare_llama_dll_env()  # CUDA 运行时不在 PATH 时补上，否则加载 llama.dll 会失败
-        try:
-            from llama_cpp import Llama
-
-            _llm = Llama(
-                model_path=str(path),
-                n_ctx=2048,
-                n_threads=max(1, (os.cpu_count() or 4) // 2),
-                n_batch=256,
-                n_gpu_layers=999 if use_gpu else 0,
-                verbose=False,
-            )
-            _llm_path = str(path)
-            _llm_last_used = time.time()  # 加载成功即开始空闲计时
-            _llm_load_error = ""
-        except Exception as e:
-            _llm = None
-            _llm_path = ""
-            _llm_load_error = _t("llm.status.loadFailed", msg=e)
-            # GPU 加载失败（如显存被 SD 占满）时自动降级重试一次 CPU
-            if use_gpu:
-                try:
-                    from llama_cpp import Llama
-                    _llm = Llama(
-                        model_path=str(path),
-                        n_ctx=2048,
-                        n_threads=max(1, (os.cpu_count() or 4) // 2),
-                        n_batch=256,
-                        n_gpu_layers=0,
-                        verbose=False,
-                    )
-                    _llm_path = str(path)
-                    _llm_last_used = time.time()
-                    _llm_load_error = _t("llm.status.vramFallback")
-                except Exception as e2:
-                    _llm = None
-                    _llm_path = ""
-                    _llm_load_error = _t("llm.status.loadFailed", msg=e2)
-            return None
-        return _llm
-
-
-def _parse_json_loose(text: str) -> dict:
-    """从模型输出里宽松地取出 JSON 对象（容忍 ```json 包裹与前后废话）。"""
-    if not text:
-        return {}
-    s = str(text).strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    try:
-        data = json.loads(s)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    start, end = s.find("{"), s.rfind("}")
-    if start != -1 and end > start:
-        try:
-            data = json.loads(s[start:end + 1])
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-LLM_SYSTEM_PROMPT = "你是 AI 绘画提示词翻译专家，只输出 JSON，不输出任何多余文字。"
-
-LLM_USER_PROMPT = """把下面的英文 danbooru 标签逐个翻译成简体中文。
-
-规则：
-1. 输出一个 JSON 对象：key 必须与给出的英文原文完全一致，value 为简体中文译文。
-2. 使用 AI 绘画圈的通用译法，例如 "looking at viewer" 译为"看向观者"，"thighhighs" 译为"过膝袜"。
-3. 只有「不含空格且含数字」的自造触发词（如 kei1、my_style_v2）才原样返回英文；
-   其余标签都要翻译，用下划线连接的常见 danbooru 标签（如 open_mouth、long_hair、tentacle_sex）也要译成中文。
-4. 不要输出 JSON 以外的任何内容。
-
-标签列表：
-{tags}"""
-
-# 翻译提示预设：默认预设即内置提示词（只读，不可覆盖/删除）；用户预设存 stats.json
-PROMPT_DEFAULT_NAME = "默认"
-PROMPT_NAME_MAX = 30
-PROMPT_TEXT_MAX = 4000
-
-
-def _prompt_presets() -> dict[str, str]:
-    """全部提示预设：内置默认预设 + 用户自定义（同名以内置为准）。"""
-    presets = {PROMPT_DEFAULT_NAME: LLM_USER_PROMPT}
-    raw = _stats.get("prompt_presets")
-    if isinstance(raw, dict):
-        for k, v in raw.items():
-            name = str(k).strip()
-            text = str(v)
-            if name and name != PROMPT_DEFAULT_NAME and text.strip():
-                presets[name] = text
-    return presets
-
-
-def _active_prompt() -> tuple[str, str]:
-    """当前启用的预设 (名称, 提示文本)；名称失效时回退默认预设。"""
-    presets = _prompt_presets()
-    name = str(_stats.get("active_prompt") or PROMPT_DEFAULT_NAME)
-    if name not in presets:
-        name = PROMPT_DEFAULT_NAME
-    return name, presets[name]
-
-
-def _llm_translate_batch(tags: list[str]) -> dict[str, str]:
-    """用选中的 GGUF 模型批量翻译；不可用时返回空 dict。
-
-    全程持 _llm_lock：llama_cpp 的 C++ 实例非线程安全，并发调用
-    create_chat_completion 或推理中途 close() 都会 segfault 拖垮整个 WebUI。
-    """
-    global _llm_load_error, _llm_last_used, _llm_last_note
-    if not tags:
-        return {}
-    _llm_last_note = ""  # 每次重新判定，避免把上一次的原因带到本次
-    prompt = _active_prompt()[1].replace("{tags}", json.dumps(tags, ensure_ascii=False))
-    with _llm_lock:
-        llm = _get_llm()
-        if llm is None:
-            return {}
-        try:
-            out = llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=1536,
-                response_format={"type": "json_object"},
-            )
-            text = out["choices"][0]["message"]["content"]
-        except Exception as e:
-            _llm_load_error = _t("llm.status.inferFailed", msg=e)
-            _llm_last_used = time.time()  # 失败也算使用过，避免立刻被卸载后马上重试
-            return {}
-        _llm_last_used = time.time()  # 推理完成：刷新空闲计时起点
-    data = _parse_json_loose(text)
-    result: dict[str, str] = {}
-    for tag in tags:
-        val = data.get(tag)
-        if val is None:  # 模型可能改写了 key（大小写/下划线差异），做一次宽松匹配
-            for k, v in data.items():
-                if _normalize_tag(k) == _normalize_tag(tag):
-                    val = v
-                    break
-        if isinstance(val, str) and val.strip():
-            result[tag] = val.strip()
-    if not result:
-        # 模型确实跑完了但没给出可用译文：区分「没解析出 JSON」与「键名对不上」，
-        # 否则上层只会看到空结果，无法定位是提示预设内容有问题
-        _llm_last_note = (
-            _t("llm.status.noJson")
-            if not data else
-            _t("llm.status.tagMismatch")
-        )
-    return result
-
-
 def _cache_key() -> str:
     """译文缓存按模型分桶：换模型后自动重新翻译，不会串味。"""
-    return os.path.basename(str(_stats.get("llm_model") or ""))
-
-
-# 翻译方案：dict=仅用对照表（不调模型）/ llm=仅用模型翻译（跳过对照表）/ hybrid=混合
-TRANS_MODES = ("dict", "llm", "hybrid")
-
-
-def _translate_mode() -> str:
-    m = str(_stats.get("translate_mode") or "hybrid")
-    return m if m in TRANS_MODES else "hybrid"
+    return _llm.cache_key() if _llm is not None else ""
 
 
 def translate_tags(tags: list[str], force: bool = False) -> dict:
-    """批量翻译标签，按「翻译方案」执行。
+    """批量翻译标签，按「翻译方案」执行（实现见 lna_llm_service.translate_tags）。
 
-    方案（设置区可切换，存于 stats.json）：
+    方案（设置区可切换，两插件共用）：
       - hybrid 混合（默认）：1 对照表命中 → 采用；2 模型缓存；3 触发词原样保留；
         4 其余送 GGUF 模型
       - dict   仅用对照表：只查对照表，未收录的标签不翻译（前端显示「未完成翻译」）
       - llm    仅用模型翻译：跳过对照表，全部标签走模型（缓存与触发词保护仍生效）
     force=True 供【翻译所有标签】按钮使用：每次点击都重跑流程并覆盖旧对照。
     """
+    # 未启用共享服务时也要先读词典，保证「仅对照表」方案依然可用
     _load_tag_dict()
-    _load_trans_cache()
-    mode = _translate_mode()
-    translations: dict[str, str] = {}
-    key = _cache_key()
-    bucket = _trans_cache.setdefault(key, {}) if key else {}
-
-    pending: list[str] = []
-    seen: set[str] = set()
-    dict_used = False
-    llm_used = False
-    fallback: dict[str, str] = {}   # 对照表存疑值：模型失败时回退用
-    for raw in tags:
-        tag = str(raw)
-        if not tag or tag in seen:
-            continue
-        seen.add(tag)
-        dv = None if mode == "llm" else _tag_dict.get(_normalize_tag(tag))
-        if mode == "dict":
-            # 仅用对照表：命中即用（不调模型）；未收录则跳过，保持「未完成翻译」
-            if dv:
-                translations[tag] = dv
-                dict_used = True
-            continue
-        if dv and not _dict_value_questionable(dv):
-            translations[tag] = dv                # 高质量对照表（通过校验）优先
-            dict_used = True
-        elif dv:
-            # 对照表命中但质量存疑 → 交给模型重翻；模型不可用时回退该值
-            fallback[tag] = dv
-            if not force and tag in bucket:
-                translations[tag] = bucket[tag]
-                llm_used = True
-            else:
-                pending.append(tag)
-        elif not force and tag in bucket:
-            translations[tag] = bucket[tag]       # 模型缓存（强制重跑时跳过）
-            llm_used = True
-        elif " " not in tag and re.search(r"\d", tag):
-            # 触发词判据：无空格 + 含数字 + 对照表未收录（如 kei1、style_v2）。
-            # 这类词必须原样保留，绝不能交给模型音译
-            # （实测 2B 模型会把 kei1 翻成「凯伊1」并污染缓存）。
-            # 反例：1girl / 2girls 虽含数字但在对照表内 → 已走分支 1；
-            #       thighhighs 无数字 → 送模型翻译。
-            translations[tag] = tag
-        else:
-            pending.append(tag)
-
-    # 2) 对照表未收录的走 GGUF 推理
-    engine_note = ""
-    if pending:
-        got = _llm_translate_batch(pending)
-        if not got:
-            # 优先用「模型跑了但没产出可用译文」的具体原因，其次才是模型不可用
-            engine_note = _llm_last_note or _llm_load_error or _t("llm.status.notEnabled")
-        for tag, zh in got.items():
-            if zh and zh != tag:          # 与原文相同视为「没翻出来」，不写缓存
-                translations[tag] = zh
-                bucket[tag] = zh          # 覆盖旧译文
-                llm_used = True
-        if got:
-            _trans_cache[key] = bucket
-            _save_trans_cache()
-
-    # 3) 兜底：模型未给出结果时用对照表存疑值（仍优于原文），再否则保留原文
-    for tag in pending:
-        cur = translations.get(tag)
-        if not cur or cur == tag:
-            translations[tag] = fallback.get(tag, tag)
-
-    return {
-        "ok": True,
-        "translations": translations,
-        "engine": "llm" if llm_used else ("dict" if dict_used else "none"),
-        "note": engine_note,
-        "forced": bool(force),
-    }
-
-
-# ---------- GGUF 模型下载（官方站优先，失败自动回退 hf-mirror） ----------
-HF_ENDPOINTS = ("https://huggingface.co", "https://hf-mirror.com")
-_hf_endpoint_cache: str = ""
-# 下载进度（后台线程写入，前端轮询读取）
-_download_state: dict[str, Any] = {
-    "active": False, "filename": "", "repo": "", "done": 0, "total": 0,
-    "error": "", "ok": False, "endpoint": "", "attempt": 0,
-}
-_download_lock = threading.Lock()
-
-DL_MAX_ATTEMPTS = 8          # 大文件在镜像上容易中途断流，允许多次续传重试
-DL_READ_TIMEOUT = 60         # 单次 socket 读超时(秒)，过小会在慢速镜像上误判失败
-DL_CHUNK = 1024 * 256
-
-
-def _pick_hf_endpoint(force: bool = False) -> str:
-    """探测可用的 HuggingFace 端点：先试官方站，超时/失败则回退镜像。"""
-    global _hf_endpoint_cache
-    if _hf_endpoint_cache and not force:
-        return _hf_endpoint_cache
-    for base in HF_ENDPOINTS:
-        try:
-            req = urllib.request.Request(base, method="HEAD")
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                if resp.status < 500:
-                    _hf_endpoint_cache = base
-                    return base
-        except Exception:
-            continue
-    _hf_endpoint_cache = HF_ENDPOINTS[-1]  # 都探测不到时兜底用镜像
-    return _hf_endpoint_cache
-
-
-def _normalize_repo(s: str) -> str:
-    """把仓库 ID 或各种 HF/hf-mirror URL 统一成 owner/name 形式。"""
-    s = (s or "").strip()
-    for host in ("https://huggingface.co/", "http://huggingface.co/",
-                 "https://hf-mirror.com/", "http://hf-mirror.com/"):
-        if s.lower().startswith(host):
-            s = s[len(host):]
-            break
-    for marker in ("/tree/main", "/tree/master", "/tree/", "/resolve/main/",
-                   "/blob/main/", "/blob/"):
-        if marker in s:
-            s = s.split(marker)[0]
-            break
-    return s.strip("/ ")
-
-
-def _hf_list_gguf(repo: str) -> list[dict]:
-    """列出仓库中的 .gguf 文件（含大小），用于下载前选择量化版本。"""
-    repo = _normalize_repo(repo)
-    if not repo or "/" not in repo:
-        return []
-    base = _pick_hf_endpoint()
-    # blobs=true 才会在 siblings 里带上每个文件的大小
-    url = f"{base}/api/models/{repo}?blobs=true"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "sd-forge-lora-new"})
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    except Exception:
-        return []
-    out: list[dict] = []
-    for item in data.get("siblings", []) or []:
-        fn = str(item.get("rfilename") or "")
-        if not fn.lower().endswith(".gguf"):
-            continue
-        # 不同版本字段名不一致，逐个兜底
-        size = item.get("size")
-        if size is None:
-            blob = item.get("blobId")
-            size = item.get("lfs", {}).get("size") if isinstance(item.get("lfs"), dict) else None
-            if size is None and isinstance(blob, dict):
-                size = blob.get("size")
-        out.append({"filename": fn, "size": int(size or 0)})
-    return out
-
-
-def _download_worker(repo: str, filename: str) -> None:
-    """后台下载线程：流式写入 LLM_DIR，断流时用 Range 续传，实时更新进度。"""
-    base = _pick_hf_endpoint()
-    url = f"{base}/{repo}/resolve/main/{filename}"
-    dest = LLM_DIR.joinpath(*[p for p in filename.split("/") if p])
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    last_err = ""
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(1, DL_MAX_ATTEMPTS + 1):
-            got = tmp.stat().st_size if tmp.exists() else 0
-            headers = {"User-Agent": "sd-forge-lora-new"}
-            if got:
-                headers["Range"] = f"bytes={got}-"   # 断点续传
-            try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=DL_READ_TIMEOUT) as resp:
-                    # 服务端不支持续传会回 200，此时必须从头写，否则文件会损坏
-                    if got and resp.status != 206:
-                        got = 0
-                    clen = int(resp.headers.get("Content-Length") or 0)
-                    total = (got + clen) if clen else got
-                    with _download_lock:
-                        _download_state.update(
-                            total=total, endpoint=base, done=got, attempt=attempt,
-                        )
-                    with tmp.open("ab" if got else "wb") as fh:
-                        while True:
-                            chunk = resp.read(DL_CHUNK)
-                            if not chunk:
-                                break
-                            fh.write(chunk)
-                            with _download_lock:
-                                _download_state["done"] += len(chunk)
-            except Exception as e:
-                last_err = f"{e}"
-                continue  # 断流：保留 .part，下一轮从断点继续
-            size = tmp.stat().st_size if tmp.exists() else 0
-            if total and size < total:
-                last_err = _t("dl.incomplete", size=size, total=total)
-                continue
-            tmp.replace(dest)  # 完整落盘后才改名，避免半成品被当成可用模型
-            with _download_lock:
-                _download_state.update(active=False, ok=True, error="")
-            return
-        raise RuntimeError(last_err or _t("dl.retryExhausted"))
-    except Exception as e:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-        with _download_lock:
-            _download_state.update(active=False, ok=False, error=_t("dl.failed", msg=e))
-
-
-# ---------- 翻译运行时的构建探测与 CUDA 轮子下载 ----------
-_runtime_probe_lock = threading.Lock()
-_runtime_probe_cache: dict[str, Any] = {"at": 0.0, "value": None}
-RUNTIME_PROBE_TTL = 60.0  # 探测结果缓存秒数：设置弹窗可能反复查询
-
-_runtime_dl_lock = threading.Lock()
-_runtime_dl_state: dict[str, Any] = {
-    "active": False, "done": 0, "total": 0, "error": "", "ok": False, "attempt": 0,
-}
-
-
-def _probe_runtime(force: bool = False) -> dict:
-    """探测当前 llama-cpp-python 的构建类型与可用性（**唯一**被动的引擎探测入口）。
-
-    必须放到子进程里执行：CUDA 版若缺少运行库，导入可能直接结束进程；
-    同时也要能区分「装了但导不进来」（此时 CPU/GPU 都用不了）。
-    子进程继承本进程 env，故先补齐 CUDA 运行库 PATH（见 `_prepare_llama_dll_env`），
-    否则探测结论会与真正加载模型时不一致（把可用的 CUDA 轮子误判为不可用）。
-    """
-    with _runtime_probe_lock:
-        cached = _runtime_probe_cache["value"]
-        if not force and cached is not None and (time.time() - _runtime_probe_cache["at"]) < RUNTIME_PROBE_TTL:
-            return cached
-    _prepare_llama_dll_env()
-    result = {"installed": False, "usable": False, "build": "", "error": ""}
-    code = (
-        "import llama_cpp;"
-        "info=llama_cpp.llama_print_system_info();"
-        "info=info.decode('utf-8','ignore') if isinstance(info,bytes) else str(info);"
-        "print('__LNA_CUDA__' if 'CUDA' in info else '__LNA_CPU__')"
-    )
-    try:
-        p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
-        if p.returncode == 0:
-            out = p.stdout or ""
-            result["installed"] = True
-            result["usable"] = True
-            result["build"] = "cuda" if "__LNA_CUDA__" in out else ("cpu" if "__LNA_CPU__" in out else "")
-        else:
-            # 子进程导入失败/崩溃：留一段 stderr 供界面显示具体原因
-            result["error"] = (p.stderr or "").strip()[-300:]
-    except Exception as e:
-        result["error"] = str(e)
-    if not result["installed"]:
-        try:
-            result["installed"] = importlib.util.find_spec("llama_cpp") is not None
-        except Exception:
-            result["installed"] = False
-    with _runtime_probe_lock:
-        _runtime_probe_cache.update(at=time.time(), value=result)
-    return result
-
-
-def _nvidia_driver() -> str:
-    """NVIDIA 驱动版本字符串；无 N 卡或没有 nvidia-smi 时返回空串。"""
-    try:
-        p = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=15,
-        )
-    except Exception:
-        return ""
-    if p.returncode != 0:
-        return ""
-    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
-    return lines[0] if lines else ""
-
-
-def _nvidia_ok() -> tuple[bool, str]:
-    """(驱动是否满足 cu124 的最低要求, 驱动版本字符串)。"""
-    ver = _nvidia_driver()
-    nums = re.findall(r"\d+", ver)
-    ok = len(nums) >= 2 and (int(nums[0]), int(nums[1])) >= MIN_CUDA_DRIVER
-    return ok, ver
-
-
-def _cuda_wheel_path() -> Path:
-    return CUDA_WHEELS_DIR / CUDA_WHEEL_NAME
-
-
-def _cuda_wheel_downloaded() -> bool:
-    try:
-        return _cuda_wheel_path().is_file()
-    except Exception:
-        return False
-
-
-def _cuda_wheel_partial_size() -> int:
-    """未完成下载留下的 .part 大小（字节）；用于让进度条从中断处开始显示。"""
-    p = _cuda_wheel_path()
-    part = p.with_suffix(p.suffix + ".part")
-    try:
-        return part.stat().st_size if part.is_file() else 0
-    except Exception:
-        return 0
-
-
-def _remote_file_size(url: str) -> int:
-    """取远端文件总大小（字节）；失败返回 0（表示未知）。
-
-    用 `Range: bytes=0-0` 读 Content-Range 里的总长度，而不用 HEAD：
-    GitHub 的下载链接对 HEAD 会超时（实测），而带 Range 的 GET 稳定可用，
-    且与真正的下载走同一条路径。用于校验断点续传的半成品是否与远端一致。
-    """
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "sd-forge-lora-new", "Range": "bytes=0-0"}
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            content_range = resp.headers.get("Content-Range") or ""
-            if "/" in content_range:
-                tail = content_range.rsplit("/", 1)[-1].strip()
-                if tail.isdigit():
-                    return int(tail)
-            return int(resp.headers.get("Content-Length") or 0)
-    except Exception:
-        return 0
-
-
-def _cuda_wheel_worker() -> None:
-    """后台下载 CUDA 轮子到 wheels/cuda/；断流用 Range 续传，实时更新进度。
-
-    任务彻底失败时**保留 .part 半成品**，用户再点一次即可从断点继续，不必重下整个文件。
-    """
-    dest = _cuda_wheel_path()
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    last_err = ""
-    total = 0
-    try:
-        CUDA_WHEELS_DIR.mkdir(parents=True, exist_ok=True)
-        remote_size = _remote_file_size(CUDA_WHEEL_URL)
-
-        # 半成品预检：比远端还大说明是过期/损坏的残留（远端已换文件），丢掉重下；
-        # 正好等于远端大小说明上次其实已经下完，直接改名收尾。
-        if tmp.exists() and remote_size:
-            have = tmp.stat().st_size
-            if have > remote_size:
-                tmp.unlink()
-            elif have == remote_size:
-                tmp.replace(dest)
-                with _runtime_dl_lock:
-                    _runtime_dl_state.update(active=False, ok=True, error="")
-                return
-
-        for attempt in range(1, DL_MAX_ATTEMPTS + 1):
-            got = tmp.stat().st_size if tmp.exists() else 0
-            if remote_size and got >= remote_size:
-                break  # 已下满，交给循环外的完整性确认收尾
-            headers = {"User-Agent": "sd-forge-lora-new"}
-            if got:
-                headers["Range"] = f"bytes={got}-"
-            try:
-                req = urllib.request.Request(CUDA_WHEEL_URL, headers=headers)
-                with urllib.request.urlopen(req, timeout=DL_READ_TIMEOUT) as resp:
-                    # 服务端不支持续传会回 200，此时必须从头写，否则文件会损坏
-                    if got and resp.status != 206:
-                        got = 0
-                    clen = int(resp.headers.get("Content-Length") or 0)
-                    total = (got + clen) if clen else (remote_size or got)
-                    with _runtime_dl_lock:
-                        _runtime_dl_state.update(done=got, total=total, attempt=attempt)
-                    with tmp.open("ab" if got else "wb") as fh:
-                        while True:
-                            chunk = resp.read(DL_CHUNK)
-                            if not chunk:
-                                break
-                            fh.write(chunk)
-                            with _runtime_dl_lock:
-                                _runtime_dl_state["done"] += len(chunk)
-            except urllib.error.HTTPError as e:
-                if e.code == 416 and tmp.exists():
-                    # 断点位置超出远端文件（远端变小或换了文件）→ 丢掉半成品重来
-                    tmp.unlink()
-                    last_err = _t("dl.resumeInvalid")
-                    continue
-                last_err = f"{e}"
-                continue  # 断流：保留 .part，下一轮从断点继续
-            except Exception as e:
-                last_err = f"{e}"
-                continue
-            size = tmp.stat().st_size if tmp.exists() else 0
-            expected = remote_size or total
-            if expected and size != expected:
-                last_err = _t("dl.incomplete", size=size, total=expected)
-                continue
-            tmp.replace(dest)  # 完整落盘后才改名，避免半成品被当成可用轮子
-            with _runtime_dl_lock:
-                _runtime_dl_state.update(active=False, ok=True, error="")
-            return
-
-        # 走到这里：要么是「已下满」跳出，要么是重试次数用尽
-        size = tmp.stat().st_size if tmp.exists() else 0
-        if remote_size and size == remote_size:
-            tmp.replace(dest)
-            with _runtime_dl_lock:
-                _runtime_dl_state.update(active=False, ok=True, error="")
-            return
-        raise RuntimeError(last_err or _t("dl.retryExhausted"))
-    except Exception as e:
-        # 保留 .part：下次点按钮可从断点续传，不必重下整个文件
-        kept = 0
-        try:
-            kept = tmp.stat().st_size if tmp.exists() else 0
-        except Exception:
-            kept = 0
-        hint = _t("dl.resumeKept", mb=kept // 1048576) if kept else ""
-        with _runtime_dl_lock:
-            _runtime_dl_state.update(active=False, ok=False, error=_t("dl.failed", msg=f"{e}{hint}"))
+    if _llm is None:
+        return {
+            "ok": True,
+            "translations": {str(t): str(t) for t in tags},
+            "engine": "none",
+            "note": _t("llm.status.notEnabled"),
+            "forced": bool(force),
+        }
+    res = _llm.translate_tags([str(t) for t in tags], force=bool(force))
+    if not res.get("note"):
+        res["note"] = _llm.reason()
+    return res
 
 
 # ---------- 卡片设置资料 JSON（按模型镜像存储，文件名加 _new 后缀） ----------
@@ -2531,7 +1718,10 @@ def _reveal_in_explorer(abs_path: Path) -> str | None:
 def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
     if LORA_DIR.exists():
         app.mount("/lora_new_files", StaticFiles(directory=str(LORA_DIR)), name="lora_new_files")
-    _ensure_watchdog()  # 启动空闲自动卸载守护线程（只启动一次）
+    # 共享 LLM 服务：登记归属 + 启动空闲卸载守护线程（整个进程只启动一次）
+    if _llm is not None:
+        _llm.set_owner("lora_new")
+        _llm.ensure_watchdog()
     _ensure_lora_engine()  # sd_forge_lora 未启用时自带 <lora:...> 引擎
 
     # ---------- 界面多语言（i18n） ----------
@@ -2614,83 +1804,76 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
 
     @app.post("/lora_new/api/llm_open_folder")
     def api_llm_open_folder():
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        folder = _llm.llm_dir()
         try:
-            LLM_DIR.mkdir(parents=True, exist_ok=True)
+            folder.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             return {"ok": False, "error": _t("err.modelDirUnavailable", msg=e)}
-        err = _open_in_explorer(LLM_DIR)
+        err = _open_in_explorer(folder)
         if err:
             return {"ok": False, "error": err}
-        return {"ok": True, "path": str(LLM_DIR)}
+        return {"ok": True, "path": str(folder)}
 
     @app.post("/lora_new/api/translate")
     def api_translate(payload: dict):
         tags = payload.get("tags", [])
         if not isinstance(tags, list):
             return {"ok": False, "error": _t("err.tagsNotArray")}
-        # 全局「翻译正在进行」标记：多个浏览器标签页共用同一后端，
-        # 已有任务在跑时直接拒绝（busy=true），前端据此显示忙碌态并轮询等待
-        with _translate_state_lock:
-            if _translate_state["busy"]:
-                return {"ok": False, "busy": True, "error": _t("err.translateBusy")}
-            _translate_state["busy"] = True
-        try:
-            # force=true（【翻译所有标签】按钮）：重跑流程并覆盖旧译文，不吃模型缓存
-            res = translate_tags([str(t) for t in tags][:200], force=bool(payload.get("force")))
-            # 译文同步持久化到该模型的镜像 JSON（按语言分组，供以后多语言对照）
-            rel = _safe_rel(str(payload.get("rel") or ""))
-            if rel and res.get("ok"):
-                _store_card_translations(rel, "zh", res.get("translations") or {})
-            return res
-        finally:
-            with _translate_state_lock:
-                _translate_state["busy"] = False
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        # 已有任务在跑（含 prompt 插件的翻译）时直接拒绝，前端显示忙碌态并轮询等待
+        if _llm.busy():
+            return {"ok": False, "busy": True, "error": _t("err.translateBusy")}
+        # force=true（【翻译所有标签】按钮）：重跑流程并覆盖旧译文，不吃模型缓存
+        res = translate_tags([str(t) for t in tags][:200], force=bool(payload.get("force")))
+        # 译文同步持久化到该模型的镜像 JSON（按语言分组，供以后多语言对照）
+        rel = _safe_rel(str(payload.get("rel") or ""))
+        if rel and res.get("ok"):
+            _store_card_translations(rel, "zh", res.get("translations") or {})
+        return res
 
     @app.get("/lora_new/api/translate_status")
     def api_translate_status():
-        with _translate_state_lock:
-            return {"ok": True, "busy": _translate_state["busy"]}
+        return {"ok": True, "busy": bool(_llm.busy()) if _llm is not None else False}
 
     @app.get("/lora_new/api/llm_models")
     def api_llm_models():
-        # 引擎/设备探测走子进程（_probe_runtime）：不在本进程 import llama_cpp，
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        # 引擎/设备探测走子进程：不在本进程 import llama_cpp，
         # 避免仅「打开设置弹窗」就初始化 ggml CUDA 后端（显存吃紧时是崩溃诱因）。
-        probe = _probe_runtime()
+        probe = _llm.probe_runtime()
+        st = _llm.status()
         return {
             "ok": True,
-            "models": _scan_llm_models(),
-            "selected": str(_stats.get("llm_model") or ""),
+            "models": _llm.scan_models(),
+            "selected": st["selected"],
             "engine_ready": bool(probe["usable"]),
             "engine_error": str(probe.get("error") or ""),
             "cuda_available": probe["build"] == "cuda",
-            "gpu": bool(_stats.get("llm_gpu")),
-            "loaded": _llm_path,
+            "gpu": bool(st["gpu"]),
+            "loaded": st["loaded_path"],
         }
 
     @app.post("/lora_new/api/llm_gpu")
     def api_llm_gpu(payload: dict):
-        want = bool(payload.get("gpu"))
-        if want and not _cuda_available():
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        res = _llm.set_gpu(bool(payload.get("gpu")), owner="lora_new")
+        if not res.get("ok") and res.get("error") == "cpuBuildNoGpu":
             return {"ok": False, "error": _t("err.cpuBuildNoGpu")}
-        if want == bool(_stats.get("llm_gpu")):
-            return {"ok": True, "gpu": want}
-        _stats["llm_gpu"] = want
-        _save_stats()
-        _unload_llm()  # 切换设备需重新加载模型
-        return {"ok": True, "gpu": want}
+        return res
 
     @app.post("/lora_new/api/llm_select")
     def api_llm_select(payload: dict):
-        global _llm_load_error
-        rel = str(payload.get("rel") or "")
-        if rel and _resolve_llm_path(rel) is None:
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        res = _llm.select_model(str(payload.get("rel") or ""), owner="lora_new")
+        if not res.get("ok") and res.get("error") == "Invalid model path":
             return {"ok": False, "error": _t("err.invalidModelPath")}
-        if str(_stats.get("llm_model") or "") != rel:
-            _unload_llm()  # 换模型：立即释放旧实例
-        _stats["llm_model"] = rel
-        _llm_load_error = ""
-        _save_stats()
-        return {"ok": True, "selected": rel}
+        return res
 
     @app.post("/lora_new/api/llm_unload")
     def api_llm_unload():
@@ -2703,31 +1886,52 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
 
     @app.post("/lora_new/api/llm_idle_settings")
     def api_llm_idle_settings(payload: dict):
-        if "auto_unload" in payload:
-            _stats["llm_auto_unload"] = bool(payload.get("auto_unload"))
-        if "minutes" in payload:
-            _stats["llm_idle_minutes"] = _clamp_idle_minutes(payload.get("minutes"))
-        _save_stats()
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        _llm.set_idle_settings(
+            auto_unload=bool(payload["auto_unload"]) if "auto_unload" in payload else None,
+            minutes=payload.get("minutes") if "minutes" in payload else None,
+            owner="lora_new",
+        )
         return {"ok": True, **_llm_status()}
 
     @app.post("/lora_new/api/translate_mode")
     def api_translate_mode(payload: dict):
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
         mode = str((payload or {}).get("mode") or "")
-        if mode not in TRANS_MODES:
+        if mode not in _llm.TRANS_MODES:
             return {"ok": False, "error": _t("err.invalidTransMode")}
-        _stats["translate_mode"] = mode
-        _save_stats()
+        _llm.set_translate_mode(mode, owner="lora_new")
         return {"ok": True, "mode": mode}
 
+    # 共享服务返回的英文错误 → 本插件语言包里的键
+    _PRESET_ERR = {
+        "Need preset name": "err.needPresetName",
+        "Preset name reserved": "err.presetNameReserved",
+        "Preset name too long": "err.presetNameTooLong",
+        "Prompt is empty": "err.promptEmpty",
+        "Prompt too long": "err.promptTooLong",
+        "Prompt needs {tags}": "err.promptNeedPlaceholder",
+        "Default preset is not deletable": "err.presetDefaultUndeletable",
+        "Preset not found": "err.presetNotFound",
+        "Invalid action": "err.invalidAction",
+    }
+
+    def _preset_err(msg: str) -> str:
+        key = _PRESET_ERR.get(msg)
+        if key == "err.presetNameTooLong":
+            return _t(key, n=_llm.PROMPT_NAME_MAX)
+        if key == "err.promptTooLong":
+            return _t(key, n=_llm.PROMPT_TEXT_MAX)
+        return _t(key) if key else str(msg)
+
     def _prompt_payload() -> dict:
-        name, text = _active_prompt()
-        return {
-            "ok": True,
-            "active": name,
-            "text": text,
-            "default_name": PROMPT_DEFAULT_NAME,
-            "presets": [{"name": k, "text": v} for k, v in _prompt_presets().items()],
-        }
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        res = _llm.prompt_payload()
+        res.setdefault("default_name", _llm.PROMPT_DEFAULT_NAME)
+        return res
 
     @app.get("/lora_new/api/prompt_presets")
     def api_prompt_presets_list():
@@ -2738,122 +1942,84 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         payload = payload or {}
         action = str(payload.get("action") or "save")
         name = str(payload.get("name") or "").strip()
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
 
         if action == "save":
-            text = str(payload.get("text") or "")
-            if not name:
-                return {"ok": False, "error": _t("err.needPresetName")}
-            if name == PROMPT_DEFAULT_NAME:
-                return {"ok": False, "error": _t("err.presetNameReserved")}
-            if len(name) > PROMPT_NAME_MAX:
-                return {"ok": False, "error": _t("err.presetNameTooLong", n=PROMPT_NAME_MAX)}
-            if not text.strip():
-                return {"ok": False, "error": _t("err.promptEmpty")}
-            if len(text) > PROMPT_TEXT_MAX:
-                return {"ok": False, "error": _t("err.promptTooLong", n=PROMPT_TEXT_MAX)}
-            if "{tags}" not in text:
-                return {"ok": False, "error": _t("err.promptNeedPlaceholder")}
-            presets = _stats.setdefault("prompt_presets", {})
-            presets[name] = text
-            _stats["active_prompt"] = name
-            _save_stats()
-            return _prompt_payload()
+            res = _llm.save_preset(name, str(payload.get("text") or ""), owner="lora_new")
+        elif action == "delete":
+            res = _llm.delete_preset(name, owner="lora_new")
+        elif action == "select":
+            res = _llm.select_preset(name, owner="lora_new")
+        else:
+            return {"ok": False, "error": _t("err.invalidAction")}
 
-        if action == "delete":
-            if name == PROMPT_DEFAULT_NAME:
-                return {"ok": False, "error": _t("err.presetDefaultUndeletable")}
-            presets = _stats.get("prompt_presets")
-            if not isinstance(presets, dict) or name not in presets:
-                return {"ok": False, "error": _t("err.presetNotFound")}
-            del presets[name]
-            if str(_stats.get("active_prompt") or "") == name:
-                _stats["active_prompt"] = ""  # 删掉正在用的 → 回到默认预设
-            _save_stats()
-            return _prompt_payload()
-
-        if action == "select":
-            if name not in _prompt_presets():
-                return {"ok": False, "error": _t("err.presetNotFound")}
-            _stats["active_prompt"] = name
-            _save_stats()
-            return _prompt_payload()
-
-        return {"ok": False, "error": _t("err.invalidAction")}
+        if not res.get("ok"):
+            return {"ok": False, "error": _preset_err(str(res.get("error") or ""))}
+        return _prompt_payload()
 
     @app.post("/lora_new/api/llm_repo_files")
     def api_llm_repo_files(payload: dict):
-        repo = _normalize_repo(str(payload.get("repo") or ""))
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        repo = _llm._normalize_repo(str(payload.get("repo") or ""))
         if not repo or "/" not in repo:
             return {"ok": False, "error": _t("err.repoFormat")}
-        files = _hf_list_gguf(repo)
+        files = _llm._hf_list_gguf(repo)
         if not files:
             return {"ok": False, "error": _t("err.repoNoGguf"), "repo": repo}
         files.sort(key=lambda x: x["filename"])
         return {"ok": True, "repo": repo, "files": files,
-                "endpoint": _pick_hf_endpoint(), "dir": str(LLM_DIR)}
+                "endpoint": _llm._pick_hf_endpoint(), "dir": str(_llm.llm_dir())}
 
     @app.post("/lora_new/api/llm_download")
     def api_llm_download(payload: dict):
-        repo = _normalize_repo(str(payload.get("repo") or ""))
-        filename = str(payload.get("filename") or "")
-        if not repo or "/" not in repo:
-            return {"ok": False, "error": _t("err.invalidRepo")}
-        if not filename.lower().endswith(".gguf") or ".." in filename:
-            return {"ok": False, "error": _t("err.invalidFilename")}
-        with _download_lock:
-            if _download_state["active"]:
-                return {"ok": False, "error": _t("err.downloadBusy")}
-            _download_state.update(
-                active=True, ok=False, error="", filename=filename,
-                repo=repo, done=0, total=0, endpoint="",
-            )
-        threading.Thread(target=_download_worker, args=(repo, filename), daemon=True).start()
-        return {"ok": True, "filename": filename}
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        res = _llm.start_download(str(payload.get("repo") or ""), str(payload.get("filename") or ""))
+        _DL_ERR = {
+            "Invalid repo": "err.invalidRepo",
+            "Invalid filename": "err.invalidFilename",
+            "Download busy": "err.downloadBusy",
+        }
+        if not res.get("ok"):
+            key = _DL_ERR.get(str(res.get("error") or ""))
+            return {"ok": False, "error": _t(key) if key else str(res.get("error") or "")}
+        return res
 
     @app.get("/lora_new/api/llm_download_status")
     def api_llm_download_status():
-        with _download_lock:
-            return {"ok": True, **_download_state}
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        return {"ok": True, **_llm.download_status()}
 
     @app.get("/lora_new/api/runtime_info")
     def api_runtime_info(force: bool = False):
-        probe = _probe_runtime(force=bool(force))
-        nv_ok, nv_ver = _nvidia_ok()
-        return {
-            "ok": True,
-            "installed": probe["installed"],     # 是否装了 llama_cpp
-            "usable": probe["usable"],           # 是否能正常导入（装了但导不进来时为 False）
-            "build": probe["build"],             # "cuda" / "cpu" / ""
-            "version": RUNTIME_VERSION,
-            "cuda_wheel_ready": _cuda_wheel_downloaded(),
-            "nvidia_ok": nv_ok,
-            "driver": nv_ver,
-            "min_driver": ".".join(str(x) for x in MIN_CUDA_DRIVER),
-        }
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        return _llm.runtime_info(force=bool(force))
 
     @app.post("/lora_new/api/runtime_download_cuda")
     def api_runtime_download_cuda():
-        if _cuda_wheel_downloaded():
-            return {"ok": True, "already": True}
-        nv_ok, nv_ver = _nvidia_ok()
-        if not nv_ok:
-            min_ver = ".".join(str(x) for x in MIN_CUDA_DRIVER)
-            hint = _t("err.driverHint", v=nv_ver) if nv_ver else ""
-            return {"ok": False, "error": _t("err.noNvidia", min=min_ver, hint=hint)}
-        with _runtime_dl_lock:
-            if _runtime_dl_state["active"]:
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        res = _llm.start_cuda_download()
+        min_ver = ".".join(str(x) for x in _llm.MIN_CUDA_DRIVER)
+        if not res.get("ok"):
+            if res.get("error") == "No NVIDIA GPU":
+                nv_ver = res.get("driver") or ""
+                hint = _t("err.driverHint", v=nv_ver) if nv_ver else ""
+                return {"ok": False, "error": _t("err.noNvidia", min=min_ver, hint=hint)}
+            if res.get("error") == "Download busy":
                 return {"ok": False, "error": _t("err.downloadBusy")}
-            # done 从已有 .part 的大小起算：续传时进度条直接从中断处继续
-            _runtime_dl_state.update(
-                active=True, ok=False, error="", done=_cuda_wheel_partial_size(), total=0, attempt=0,
-            )
-        threading.Thread(target=_cuda_wheel_worker, daemon=True, name="lna-cuda-wheel").start()
-        return {"ok": True}
+            return {"ok": False, "error": str(res.get("error") or "")}
+        return res
 
     @app.get("/lora_new/api/runtime_download_status")
     def api_runtime_download_status():
-        with _runtime_dl_lock:
-            st = dict(_runtime_dl_state)
+        if _llm is None:
+            return {"ok": False, "error": _t("llm.status.notEnabled")}
+        st = _llm.runtime_download_status()
         return {
             "ok": True,
             "active": st["active"],
@@ -2862,7 +2028,7 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
             "attempt": st["attempt"],
             "error": st["error"],
             "finished": st["ok"],           # 命名避开与请求状态 ok 冲突
-            "cuda_wheel_ready": _cuda_wheel_downloaded(),
+            "cuda_wheel_ready": st["cuda_wheel_ready"],
         }
 
     @app.post("/lora_new/api/match_old_data")
@@ -3078,12 +2244,8 @@ def on_app_started(_: gr.Blocks, app: FastAPI) -> None:
         # 随模型迁移：并入 translations.zh，供 card_info 读取显示
         _store_card_translations(rel, "zh", {tag: value})
         # 全局缓存按当前模型分桶：后续非强制的翻译直接复用人工译文
-        with _json_lock:
-            _load_trans_cache()
-            key = _cache_key()
-            if key:
-                _trans_cache.setdefault(key, {})[tag] = value
-                _save_trans_cache()
+        if _llm is not None:
+            _llm.set_cached_translation(tag, value)
         return {"ok": True, "tag": tag, "value": value}
 
     @app.post("/lora_new/api/use")
