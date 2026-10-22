@@ -338,6 +338,8 @@
     editZh: '<svg class="lna-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.6 3.4a2.1 2.1 0 0 1 3 3L7.6 18.4l-4 1 1-4z"></path></svg>',
     // 列表（查看模型所有标签）
     list: '<svg class="lna-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"></path><path d="M3.6 6h.01M3.6 12h.01M3.6 18h.01"></path></svg>',
+    // 网页链接（下载站地址前的小图标）
+    link: '<svg class="lna-dl-link-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13.5a4.2 4.2 0 0 0 6 0l2.8-2.8a4.2 4.2 0 0 0-6-6l-1.4 1.4"></path><path d="M14 10.5a4.2 4.2 0 0 0-6 0l-2.8 2.8a4.2 4.2 0 0 0 6 6l1.4-1.4"></path></svg>',
   };
 
   // ---------- HTML 模板（用 class，不用 id） ----------
@@ -1201,7 +1203,9 @@
               <div class="lna-switch-row">
                 <span class="lna-switch-text">
                   <span class="lna-switch-name">${t('settings.download.name')}</span>
-                  <span class="lna-switch-desc">${t('settings.download.desc')}</span>
+                  <span class="lna-switch-desc">${t('settings.download.desc')}
+                    <span class="lna-dl-links"><a href="https://huggingface.co/models" target="_blank" rel="noopener noreferrer">${ICON.link}https://huggingface.co/models</a><a href="https://hf-mirror.com/models" target="_blank" rel="noopener noreferrer">${ICON.link}https://hf-mirror.com/models</a></span>
+                  </span>
                 </span>
                 <div class="lna-llm-dl">
                   <div class="lna-llm-dl-row">
