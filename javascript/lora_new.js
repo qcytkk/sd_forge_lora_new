@@ -3689,6 +3689,7 @@
       tsSpinner.hidden = true;
       tsLabel.textContent = t('cf.allTagsTranslate');
       setDlgBusy(body, false);
+      applyDictToRows(); // 译文刷新后重算【加入词典】配色（与词典一致=绿 / 有差异=黄）
       refreshLlmState(); // 翻译可能触发模型加载，立即刷新顶栏状态按钮
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
       tsTime.textContent = ok ? t('cf.lastTook', { secs }) : t('cf.translateFailed');
