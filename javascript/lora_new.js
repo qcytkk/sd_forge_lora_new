@@ -3387,17 +3387,28 @@
     dlg.innerHTML = `
       <header>
         <span class="dlg-title">${t('cf.allTagsLabel')}<span class="lna-cf-hint">${t('cf.allTagsHint')}</span></span>
-        <label class="lna-alltags-size-wrap">
-          <span class="lna-alltags-size-label">${t('cf.allTagsSize')}</span>
-          <select class="lna-alltags-size" aria-label="${esc(t('cf.allTagsSize'))}">
-            <option value="20">20</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-            <option value="200">200</option>
-            <option value="500">500</option>
-            <option value="all">${t('cf.allTagsSizeAll')}</option>
-          </select>
-        </label>
+        <div class="lna-alltags-head-tools">
+          <label class="lna-alltags-filter-wrap">
+            <span class="lna-alltags-filter-label">${t('cf.allTagsFilter')}</span>
+            <select class="lna-alltags-filter" aria-label="${esc(t('cf.allTagsFilter'))}">
+              <option value="all" selected>${t('cf.allTagsFilterAll')}</option>
+              <option value="dict">${t('cf.allTagsFilterDict')}</option>
+              <option value="undict">${t('cf.allTagsFilterUndict')}</option>
+              <option value="diff">${t('cf.allTagsFilterDiff')}</option>
+            </select>
+          </label>
+          <label class="lna-alltags-size-wrap">
+            <span class="lna-alltags-size-label">${t('cf.allTagsSize')}</span>
+            <select class="lna-alltags-size" aria-label="${esc(t('cf.allTagsSize'))}">
+              <option value="20">20</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="all">${t('cf.allTagsSizeAll')}</option>
+            </select>
+          </label>
+        </div>
         <button class="dlg-close" type="button" aria-label="${esc(t('common.closeDialog'))}">${ICON.close}</button>
       </header>
       <div class="dlg-body">
@@ -3445,14 +3456,18 @@
     const prevBtn = dlg.querySelector('.lna-alltags-prev');
     const nextBtn = dlg.querySelector('.lna-alltags-next');
     const sizeSelect = dlg.querySelector('.lna-alltags-size');
+    const filterSelect = dlg.querySelector('.lna-alltags-filter');
     // 页码模板在 {cur} 处切开：数字框插在中间，「第/Page/ページ … 页」等前后缀由语言包决定，
     // 这样各语言把页码放在哪一侧都正确，无需为「输入框」再新增一套键。
     const PAGE_TPL = t('cf.allTagsPage').split('{cur}');
 
     let tags = [];
+    let view = [];              // 筛选后的可见标签（分页/翻译都以它为准）
+    const tagIndex = new Map(); // tag -> 在完整 tags 中的下标（默认显隐规则仍按完整列表判定）
     let page = 0;
     let pageSize = loadAllTagsSize(); // 每页条数；'all' 表示全部显示在一页（记忆所有卡片共用）
     sizeSelect.value = pageSize;
+    let filterMode = 'all';     // all=显示全部 / dict=已加入词典 / undict=未加入词典 / diff=与译文不同
     const zhMap = {};    // tag -> 中文译文（【翻译标签】按钮写入，第四列展示）
     const dictMap = {};  // tag -> { found, value }：词典收录情况，决定【加入词典】按钮配色
     const showMap = {};  // tag -> 'show'|'hide'：卡片设置标签池的显隐覆盖（缺省走默认规则）
@@ -3460,10 +3475,35 @@
     let translating = false;
 
     function pageRows() {
-      const n = pageSize === 'all' ? tags.length : Number(pageSize);
+      const n = pageSize === 'all' ? view.length : Number(pageSize);
       return n > 0 ? n : 1;
     }
-    function pages() { return Math.max(1, Math.ceil(tags.length / pageRows())); }
+    function pages() { return Math.max(1, Math.ceil(view.length / pageRows())); }
+
+    // 按【加入词典】按钮状态筛选可见标签（与 dictState 的配色判定保持同一套口径）
+    function rebuildView() {
+      view = tags.filter(([tag]) => {
+        if (filterMode === 'all') return true;
+        const st = dictState(tag, zhMap[tag]);
+        if (filterMode === 'dict') return st === 'is-matched' || st === 'is-diff';
+        if (filterMode === 'undict') return st === '';
+        return st === 'is-diff'; // diff：与译文不同
+      });
+    }
+
+    // 筛选生效时按最新状态重算可见集合并重绘；无匹配则显示空态
+    function refreshFilteredView() {
+      rebuildView();
+      if (!tags.length) return; // 数据尚未加载/无标签，交给原有流程处理
+      if (!view.length) { showEmpty(t('cf.allTagsFilterEmpty'), false); return; }
+      renderPage();
+    }
+
+    // 词典收录 / 译文变化后：筛选生效时重建列表，否则只就地刷新按钮配色
+    function refreshAfterDictChange() {
+      if (filterMode === 'all') { applyDictToRows(); return; }
+      refreshFilteredView();
+    }
 
     function fillTpl(part, total) {
       return String(part || '').replace('{total}', String(total)).trim();
@@ -3490,10 +3530,11 @@
       if (page > total - 1) page = total - 1;
       const size = pageRows();
       const start = page * size;
-      const rows = tags.slice(start, start + size).map(([tag, cnt], i) => {
+      const rows = view.slice(start, start + size).map(([tag, cnt], i) => {
         const zh = zhMap[tag];
         const dcls = dictState(tag, zh);
-        const shown = isShown(tag, start + i);
+        const oidx = tagIndex.get(tag);
+        const shown = isShown(tag, oidx === undefined ? 0 : oidx);
         return `
         <tr>
           <td class="lna-alltags-index">${start + i + 1}</td>
@@ -3526,7 +3567,7 @@
             <tbody>${rows}</tbody>
           </table>
         </div>`;
-      totalEl.textContent = t('cf.allTagsTotal', { n: tags.length });
+      totalEl.textContent = t('cf.allTagsTotal', { n: view.length });
       totalEl.classList.remove('is-err');
       pagePre.textContent = fillTpl(PAGE_TPL[0], total);
       pagePost.textContent = fillTpl(PAGE_TPL[1], total);
@@ -3570,11 +3611,18 @@
       pageSize = sizeSelect.value;
       saveAllTagsSize(pageSize);
       page = 0;
-      if (tags.length) renderPage();
+      refreshFilteredView();
     });
 
     prevBtn.addEventListener('click', () => { if (page > 0) { page -= 1; renderPage(); } });
     nextBtn.addEventListener('click', () => { if (page < pages() - 1) { page += 1; renderPage(); } });
+
+    // 切换筛选：按【加入词典】按钮状态重建可见标签，并回到第一页
+    filterSelect.addEventListener('change', () => {
+      filterMode = filterSelect.value;
+      page = 0;
+      refreshFilteredView();
+    });
 
     // 【翻译标签】：只翻译「当前页」显示的标签，其余页不翻译。
     // 沿用全局「翻译方案」（与卡片设置弹窗共用同一后端模式，本弹窗不再放方案控件）。
@@ -3628,7 +3676,7 @@
         const res = await r.json();
         if (closed || !document.contains(dlg) || !res || !res.ok || !res.dict) return;
         Object.assign(dictMap, res.dict);
-        applyDictToRows();
+        refreshAfterDictChange(); // 若正在按词典状态筛选，匹配结果到达后需重算列表
       } catch (e) { /* 匹配失败：保持默认灰白配色 */ }
     }
 
@@ -3652,10 +3700,10 @@
 
     tsBtn.addEventListener('click', async () => {
       if (translating) return; // 本弹窗已在翻译
-      if (!tags.length) { flashToast(t('cf.allTagsEmpty'), true); return; }
-      // 只取当前页可见的标签
+      if (!view.length) { flashToast(t('cf.allTagsEmpty'), true); return; }
+      // 只取当前页可见的标签（筛选后）
       const size = pageRows();
-      const pageTags = tags.slice(page * size, page * size + size).map((x) => x[0]);
+      const pageTags = view.slice(page * size, page * size + size).map((x) => x[0]);
       if (!pageTags.length) { flashToast(t('cf.allTagsEmpty'), true); return; }
       if (await zhStatusBusy()) { flashToast(t('toast.translating'), true); return; } // 其它标签页在跑
       translating = true;
@@ -3689,7 +3737,7 @@
       tsSpinner.hidden = true;
       tsLabel.textContent = t('cf.allTagsTranslate');
       setDlgBusy(body, false);
-      applyDictToRows(); // 译文刷新后重算【加入词典】配色（与词典一致=绿 / 有差异=黄）
+      refreshAfterDictChange(); // 译文刷新后重算【加入词典】配色；筛选生效时按新状态重绘列表
       refreshLlmState(); // 翻译可能触发模型加载，立即刷新顶栏状态按钮
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
       tsTime.textContent = ok ? t('cf.lastTook', { secs }) : t('cf.translateFailed');
@@ -3712,13 +3760,13 @@
         // 改译后：译文列与词典配色都要重算（译文变化会影响「与词典一致/有差异」的判定）
         openAllTagsEditDialog(tag, rel, zhMap, mainBody, () => {
           applyZhToRows();
-          applyDictToRows();
+          refreshAfterDictChange();
         });
       } else {
         openAllTagsDictDialog(tag, zhMap, () => {
           // 入库成功 → 该标签词典值即当前译文，按钮应变为绿色
           dictMap[tag] = { found: true, value: zhMap[tag] || '' };
-          applyDictToRows();
+          refreshAfterDictChange();
         });
       }
     });
@@ -3776,6 +3824,7 @@
           return;
         }
         tags = Array.isArray(res.tags) ? res.tags : [];
+        tags.forEach(([tag], i) => tagIndex.set(tag, i));
         // 回显已持久化的译文（刷新后仍显示），与「翻译标签」写回同一份数据
         const tr = res.tag_translations || {};
         Object.keys(tr).forEach((k) => {
@@ -3785,6 +3834,7 @@
         Object.assign(showMap, res.tag_show || {});
         if (Number(res.tag_limit) > 0) tagLimit = Number(res.tag_limit);
         if (!tags.length) { showEmpty(t('cf.allTagsEmpty'), false); return; }
+        rebuildView();
         renderPage();
         loadDictStates(); // 异步批量匹配词典，决定【加入词典】按钮配色
       } catch (e) {

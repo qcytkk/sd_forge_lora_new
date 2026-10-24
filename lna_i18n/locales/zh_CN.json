@@ -270,6 +270,12 @@
   "cf.allTagsSize": "每页条数",
   "cf.allTagsSizeAll": "全部",
   "cf.allTagsTranslate": "翻译标签",
+  "cf.allTagsFilter": "筛选",
+  "cf.allTagsFilterAll": "显示全部",
+  "cf.allTagsFilterDict": "已加入词典",
+  "cf.allTagsFilterUndict": "未加入词典",
+  "cf.allTagsFilterDiff": "与译文不同",
+  "cf.allTagsFilterEmpty": "（没有符合筛选条件的标签）",
 
   "llm.noneNoEngine": "（llama_cpp 未安装，仅用词典）",
   "llm.readModelsFailed": "读取模型列表失败",

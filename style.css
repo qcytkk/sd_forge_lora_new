@@ -1139,7 +1139,8 @@ body.dark .lna-dialog .lna-size-input { border-color: #374151; background: #1f29
 .lna-dialog .lna-llm-file,
 .lna-dialog .lna-prompt-select,
 .lna-dialog .lna-lang-select,
-.lna-dialog .lna-alltags-size {
+.lna-dialog .lna-alltags-size,
+.lna-dialog .lna-alltags-filter {
   box-sizing: border-box;
   height: 28px;
   max-width: 320px;
@@ -1155,7 +1156,8 @@ body.dark .lna-dialog .lna-llm-select,
 body.dark .lna-dialog .lna-llm-file,
 body.dark .lna-dialog .lna-prompt-select,
 body.dark .lna-dialog .lna-lang-select,
-body.dark .lna-dialog .lna-alltags-size { border-color: #374151; background: #1f2937; color: #f3f4f6; }
+body.dark .lna-dialog .lna-alltags-size,
+body.dark .lna-dialog .lna-alltags-filter { border-color: #374151; background: #1f2937; color: #f3f4f6; }
 .lna-dialog .lna-prompt-select:focus,
 .lna-dialog .lna-lang-select:focus {
   outline: none;
@@ -1887,20 +1889,30 @@ body.dark .lna-dialog .dlg-btn.lna-zh-repick.busy {
 }
 /* 总数文本占满剩余宽度，把分页控件与关闭按钮推到右侧 */
 .lna-dialog.lna-alltags-dlg .lna-alltags-total { flex: 1 1 auto; font-size: 13px; }
-/* header 内的「每页条数」下拉：margin-left:auto 让标签与关闭按钮靠右排列 */
-.lna-dialog .lna-alltags-size-wrap {
+/* header 右侧控件组（筛选 + 每页条数）：margin-left:auto 把整组连同关闭按钮推到右侧 */
+.lna-dialog .lna-alltags-head-tools {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  flex: 0 0 auto;
+}
+.lna-dialog .lna-alltags-filter-wrap,
+.lna-dialog .lna-alltags-size-wrap {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   flex: 0 0 auto;
 }
+.lna-dialog .lna-alltags-filter-label,
 .lna-dialog .lna-alltags-size-label {
   font-size: 12px;
   color: #4b5563;
   white-space: nowrap;
 }
+body.dark .lna-dialog .lna-alltags-filter-label,
 body.dark .lna-dialog .lna-alltags-size-label { color: #9ca3af; }
+.lna-dialog .lna-alltags-filter { height: 28px; min-width: 96px; }
 .lna-dialog .lna-alltags-size { height: 28px; min-width: 84px; }
 .lna-dialog .lna-alltags-pager {
   display: flex;

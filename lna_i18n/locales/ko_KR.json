@@ -270,6 +270,12 @@
   "cf.allTagsSize": "페이지당 개수",
   "cf.allTagsSizeAll": "전체",
   "cf.allTagsTranslate": "태그 번역",
+  "cf.allTagsFilter": "필터",
+  "cf.allTagsFilterAll": "전체 표시",
+  "cf.allTagsFilterDict": "사전에 있음",
+  "cf.allTagsFilterUndict": "사전에 없음",
+  "cf.allTagsFilterDiff": "번역과 다름",
+  "cf.allTagsFilterEmpty": "(필터와 일치하는 태그 없음)",
 
   "llm.noneNoEngine": "(llama_cpp 미설치 — 사전만)",
   "llm.readModelsFailed": "모델 목록을 읽지 못했습니다",

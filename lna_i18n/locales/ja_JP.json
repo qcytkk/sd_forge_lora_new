@@ -270,6 +270,12 @@
   "cf.allTagsSize": "1ページあたり",
   "cf.allTagsSizeAll": "すべて",
   "cf.allTagsTranslate": "タグを翻訳",
+  "cf.allTagsFilter": "絞り込み",
+  "cf.allTagsFilterAll": "すべて表示",
+  "cf.allTagsFilterDict": "辞書に追加済み",
+  "cf.allTagsFilterUndict": "未追加",
+  "cf.allTagsFilterDiff": "訳と異なる",
+  "cf.allTagsFilterEmpty": "（条件に一致するタグはありません）",
 
   "llm.noneNoEngine": "（llama_cpp 未インストール — 辞書のみ）",
   "llm.readModelsFailed": "モデルリストの読み取りに失敗しました",

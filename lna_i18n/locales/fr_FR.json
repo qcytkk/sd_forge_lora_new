@@ -270,6 +270,12 @@
   "cf.allTagsSize": "Par page",
   "cf.allTagsSizeAll": "Tout",
   "cf.allTagsTranslate": "Traduire les tags",
+  "cf.allTagsFilter": "Filtrer",
+  "cf.allTagsFilterAll": "Tout afficher",
+  "cf.allTagsFilterDict": "Dans le dico",
+  "cf.allTagsFilterUndict": "Hors dico",
+  "cf.allTagsFilterDiff": "Diffère de la traduction",
+  "cf.allTagsFilterEmpty": "(Aucun tag ne correspond au filtre)",
 
   "llm.noneNoEngine": "(llama_cpp non installé — dictionnaire uniquement)",
   "llm.readModelsFailed": "Échec de la lecture de la liste des modèles",

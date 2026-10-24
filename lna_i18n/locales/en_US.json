@@ -270,6 +270,12 @@
   "cf.allTagsSize": "Per page",
   "cf.allTagsSizeAll": "All",
   "cf.allTagsTranslate": "Translate tags",
+  "cf.allTagsFilter": "Filter",
+  "cf.allTagsFilterAll": "Show all",
+  "cf.allTagsFilterDict": "In dictionary",
+  "cf.allTagsFilterUndict": "Not in dictionary",
+  "cf.allTagsFilterDiff": "Differs from translation",
+  "cf.allTagsFilterEmpty": "(No tags match the filter)",
 
   "llm.noneNoEngine": "(llama_cpp not installed — dictionary only)",
   "llm.readModelsFailed": "Failed to read the model list",

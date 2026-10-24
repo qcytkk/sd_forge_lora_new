@@ -270,6 +270,12 @@
   "cf.allTagsSize": "На странице",
   "cf.allTagsSizeAll": "Все",
   "cf.allTagsTranslate": "Перевести теги",
+  "cf.allTagsFilter": "Фильтр",
+  "cf.allTagsFilterAll": "Показать все",
+  "cf.allTagsFilterDict": "В словаре",
+  "cf.allTagsFilterUndict": "Не в словаре",
+  "cf.allTagsFilterDiff": "Отличается от перевода",
+  "cf.allTagsFilterEmpty": "(Нет тегов, подходящих под фильтр)",
 
   "llm.noneNoEngine": "(llama_cpp не установлен — только словарь)",
   "llm.readModelsFailed": "Не удалось прочитать список моделей",
