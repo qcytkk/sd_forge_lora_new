@@ -4687,52 +4687,61 @@
     ta.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  // 从指定提示词框移除该 Lora 的提示词片段；返回是否有内容被移除。
-  // 正确逻辑（参考内置 sd_forge_lora：它把整个「触发词」原样拼在标签后，用户之后可能自行改写/调序）：
-  //   1) 删除任意权重的 <lora:名字:...> 标签；
-  //   2) 把卡片「触发词」字段（会和 Lora 一起添加）按逗号拆成单词，逐个从提示词框移除——
-  //      每个词按完整片段匹配（前后为逗号/空白/首尾），既不依赖整串顺序，也不会误删子串。
-  function removeLoraPromptFrom(selector, name, activation) {
+  // 标签归一化：折叠空白、转小写、剥掉外层权重括号，仅用于比对，不用于写回
+  function normalizeTag(s) {
+    return String(s)
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+      .replace(/^\((.*):[\d.]+\)$/, '$1')
+      .trim();
+  }
+
+  // 按「整标签」精确删除：提示词按逗号（含全角）与换行切成 tag，命中目标集合就整段移除，
+  // 并沿用原有分隔符重组。只做整 tag 比对，避免 "black thighhighs" 先被其中的
+  // "thighhighs" 删成 "black" 这类顺序依赖造成的残留。
+  function removeTagSetFrom(selector, targets, tagRe) {
     const box = document.querySelector(selector);
     const ta = box && box.querySelector('textarea');
     if (!ta) return false;
-    let next = ta.value || '';
-    if (!next) return false;
+    const cur = ta.value || '';
+    if (!cur) return false;
+    const parts = cur.split(/([,，\n])/); // 捕获分隔符，重组时保留原有换行/逗号风格
     let hit = false;
-    // 用「替换前后是否变化」判定命中，避开 /g 正则 lastIndex 的状态问题
-    const apply = (re, rep) => {
-      const before = next;
-      next = next.replace(re, rep);
-      if (next !== before) hit = true;
-    };
-    // 1) 标签本身（权重任意）
-    apply(new RegExp('<lora:' + escapeRegExp(name) + ':[^>]*>', 'gi'), '');
-    // 2) 触发词逐词移除
-    String(activation || '')
-      .split(/[,，\n]/)
-      .map((w) => w.trim())
-      .filter(Boolean)
-      .forEach((w) => {
-        const part = escapeRegExp(w).replace(/\s+/g, '\\s+');
-        apply(new RegExp('(^|[\\s,]+)' + part + '([\\s,]+|$)', 'gi'), ', ');
-      });
+    const out = [];
+    for (let i = 0; i < parts.length; i += 2) {
+      const seg = parts[i];
+      const sep = parts[i + 1] || '';
+      const t = normalizeTag(seg);
+      if (t && (targets.has(t) || (tagRe && tagRe.test(seg.trim())))) {
+        hit = true; // 连同其后面的分隔符一起丢弃
+        continue;
+      }
+      out.push(seg + sep);
+    }
     if (!hit) return false;
-    setPromptValue(ta, tidyPrompt(next));
+    setPromptValue(ta, tidyPrompt(out.join('')));
     return true;
   }
 
-  // 负提示词按字面移除；只认完整片段（前后为逗号/空白/首尾），避免误删子串
+  // 从指定提示词框移除该 Lora 的提示词片段；返回是否有内容被移除。
+  //   1) 删除任意权重的 <lora:名字:...> 标签（整 tag 匹配）；
+  //   2) 把卡片「触发词」字段按逗号拆开，逐个作为整 tag 移除。
+  function removeLoraPromptFrom(selector, name, activation) {
+    const targets = new Set(
+      String(activation || '').split(/[,，\n]/).map(normalizeTag).filter(Boolean)
+    );
+    const tagRe = new RegExp('^<lora:' + escapeRegExp(name) + ':[^>]*>$', 'i');
+    return removeTagSetFrom(selector, targets, tagRe);
+  }
+
+  // 负提示词同样按整 tag 移除：文本可能包含多个逗号分隔的标签，逐段比对更稳妥
   function removeTextFromPrompt(selector, text) {
-    const box = document.querySelector(selector);
-    const ta = box && box.querySelector('textarea');
-    if (!ta || !text) return false;
-    const cur = ta.value || '';
-    if (!cur) return false;
-    const re = new RegExp('(^|[\\s,]+)' + escapeRegExp(text).replace(/\s+/g, '\\s+') + '([\\s,]+|$)', 'g');
-    const next = cur.replace(re, ', ');
-    if (next === cur) return false;
-    setPromptValue(ta, tidyPrompt(next));
-    return true;
+    const targets = new Set(
+      String(text || '').split(/[,，\n]/).map(normalizeTag).filter(Boolean)
+    );
+    if (!targets.size) return false;
+    return removeTagSetFrom(selector, targets, null);
   }
 
   async function removeLoraPrompt(l) {
