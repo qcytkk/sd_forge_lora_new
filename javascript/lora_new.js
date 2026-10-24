@@ -224,6 +224,24 @@
   // 展开状态持久化（跨刷新 / 重启保留，纯本机 UI 态，存 localStorage）
   const EXPANDED_STORAGE_KEY = 'lna_expanded_folders';
 
+  // 【查看模型所有标签】每页条数：所有 LoRA 卡片共用一份记忆（纯本机 UI 态，存 localStorage）
+  const ALLTAGS_SIZE_KEY = 'lna_alltags_page_size';
+  const ALLTAGS_SIZES = ['20', '50', '100', '200', '500', 'all'];
+  const ALLTAGS_SIZE_DEFAULT = '50';
+
+  function loadAllTagsSize() {
+    try {
+      const v = localStorage.getItem(ALLTAGS_SIZE_KEY);
+      return ALLTAGS_SIZES.includes(v) ? v : ALLTAGS_SIZE_DEFAULT;
+    } catch (e) {
+      return ALLTAGS_SIZE_DEFAULT;
+    }
+  }
+
+  function saveAllTagsSize(v) {
+    try { localStorage.setItem(ALLTAGS_SIZE_KEY, v); } catch (e) {}
+  }
+
   // 插件界面设置持久化：存插件目录下的 data/ui_settings.json（后端读写）。
   // 校验后写入 state，非法值一律忽略，保持默认。
   function applySettings(s) {
@@ -3433,7 +3451,8 @@
 
     let tags = [];
     let page = 0;
-    let pageSize = '50'; // 每页条数；'all' 表示全部显示在一页
+    let pageSize = loadAllTagsSize(); // 每页条数；'all' 表示全部显示在一页（记忆所有卡片共用）
+    sizeSelect.value = pageSize;
     const zhMap = {};    // tag -> 中文译文（【翻译标签】按钮写入，第四列展示）
     const dictMap = {};  // tag -> { found, value }：词典收录情况，决定【加入词典】按钮配色
     const showMap = {};  // tag -> 'show'|'hide'：卡片设置标签池的显隐覆盖（缺省走默认规则）
@@ -3546,9 +3565,10 @@
     });
     pageInput.addEventListener('blur', commitPage);
 
-    // 切换每页条数：重置到第一页并重绘（无数据时仅改状态，不渲染空表）
+    // 切换每页条数：记住选择（所有卡片共用）→ 重置到第一页并重绘（无数据时仅改状态，不渲染空表）
     sizeSelect.addEventListener('change', () => {
       pageSize = sizeSelect.value;
+      saveAllTagsSize(pageSize);
       page = 0;
       if (tags.length) renderPage();
     });
