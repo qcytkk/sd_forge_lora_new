@@ -778,7 +778,6 @@ def set_translate_mode(mode: str, owner: str = "") -> dict:
 
 # ---------- 标签词典 / 译文缓存（lora_new 的标签翻译用；prompt 插件可指向自己的缓存） ----------
 _tag_dict: dict[str, str] = {}
-_dict_loaded = False
 _trans_cache: dict[str, dict[str, str]] = {}
 _trans_loaded = False
 _cache_file: Path = CACHE_FILE
@@ -832,11 +831,15 @@ def _is_dict_header(row: list) -> bool:
 
 
 def _load_tag_dict() -> None:
-    global _dict_loaded
-    if _dict_loaded:
-        return
-    _dict_loaded = True
+    """每次翻译都全量重读词典 CSV。
+
+    通过「加入词典」写入的新词条只落盘、不会通知本模块，缓存一次就会过期；
+    因此这里不做加载标记，直接重建。用局部字典整体替换而非原地修改，避免
+    并发读取时看到半成品；读失败时保留上一次的词典。
+    """
+    global _tag_dict
     import csv
+    loaded: dict[str, str] = {}
     try:
         with (DATA_DIR / "en_zh_dictionary.csv").open(
             "r", encoding="utf-8-sig", errors="ignore", newline=""
@@ -847,9 +850,10 @@ def _load_tag_dict() -> None:
                 key = _normalize_tag(row[0])
                 val = " ".join(str(row[1]).split())
                 if key and val:
-                    _tag_dict[key] = val
+                    loaded[key] = val
     except Exception:
-        pass
+        return
+    _tag_dict = loaded
 
 
 def _load_trans_cache() -> None:
@@ -894,6 +898,7 @@ def set_cached_translation(tag: str, value: str) -> None:
 def translate_tags(tags: list[str], force: bool = False) -> dict:
     """lora_new 的标签批量翻译（词典优先 + 模型兜底，按翻译方案执行）。"""
     _load_tag_dict()
+    tag_dict = _tag_dict   # 本次请求固定用同一份快照，避免重载时新旧混用
     _load_trans_cache()
     mode = translate_mode()
     translations: dict[str, str] = {}
@@ -911,7 +916,7 @@ def translate_tags(tags: list[str], force: bool = False) -> dict:
         if not tag or tag in seen:
             continue
         seen.add(tag)
-        dv = None if mode == "llm" else _tag_dict.get(_normalize_tag(tag))
+        dv = None if mode == "llm" else tag_dict.get(_normalize_tag(tag))
         if mode == "dict":
             if dv:
                 translations[tag] = dv
