@@ -841,7 +841,7 @@ def _load_tag_dict() -> None:
     import csv
     loaded: dict[str, str] = {}
     try:
-        with (DATA_DIR / "en_zh_dictionary.csv").open(
+        with (DATA_DIR / "sd_forge_lora_new_en_zh_dictionary.csv").open(
             "r", encoding="utf-8-sig", errors="ignore", newline=""
         ) as f:
             for row in csv.reader(f):

@@ -93,7 +93,7 @@ pip install llama-cpp-python
 | `models_json_data/` | 每个 LoRA 的卡片资料（镜像你的 LoRA 目录结构） |
 | `__pycache__/` | Python 字节码缓存 |
 
-> `data/en_zh_dictionary.csv` 是通用英中标签词典（静态资源，约 10.8 万条，首行为表头「英文,中文」），随仓库分发。
+> `data/sd_forge_lora_new_en_zh_dictionary.csv` 是通用英中标签词典（静态资源，约 10.8 万条，首行为表头「英文,中文」），随仓库分发。
 
 ## 目录结构
 
@@ -106,7 +106,7 @@ sd_forge_lora_new/
 ├── lna_lora_engine/          # 自带的 <lora:> 解析引擎
 ├── lna_i18n/                 # 界面多语言（locales/ 语言包 + 后端实现）
 ├── docs/images/              # README 截图
-├── data/                     # 运行时数据（en_zh_dictionary.csv 为静态英中词典）
+├── data/                     # 运行时数据（sd_forge_lora_new_en_zh_dictionary.csv 为静态英中词典）
 └── .gitignore
 ```
 

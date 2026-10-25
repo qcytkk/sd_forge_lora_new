@@ -40,11 +40,11 @@ DATA_DIR = EXT_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 STATS_FILE = DATA_DIR / "stats.json"
 # 标签翻译：两级对照
-# 1) en_zh_dictionary.csv  英中标签对照词典（data/ 下的静态资源，随仓库分发），
+# 1) sd_forge_lora_new_en_zh_dictionary.csv  英中标签对照词典（data/ 下的静态资源，随仓库分发），
 #                          首行为表头「英文,中文」（由 _load_tag_dict 跳过），其余每行
 #                          「英文标签,中文译文」，命中即用
 # 2) 未收录标签            → GGUF 模型实时翻译（结果缓存）
-DICT_FILE = DATA_DIR / "en_zh_dictionary.csv"
+DICT_FILE = DATA_DIR / "sd_forge_lora_new_en_zh_dictionary.csv"
 TRANSLATIONS_FILE = DATA_DIR / "translations.json"
 # 卡片设置资料：按模型存 JSON（镜像 LoRA 目录结构，文件名加 _new 后缀）。
 # 预览图像不进 JSON，仍与模型同目录同名存放（与旧版一致）。
